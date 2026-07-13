@@ -720,18 +720,28 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         });
     }
 
+    bool has_incomplete_tool = false;
     for (size_t i = 0; i < oaicompat_msg.tool_calls.size(); i++) {
         const auto & tool_call = oaicompat_msg.tool_calls[i];
         const std::string fc_item_id = (i < oai_resp_fc_item_ids.size())
             ? oai_resp_fc_item_ids[i]
             : "fc_" + random_string();
+        const bool valid = tool_call_arguments_valid(tool_call);
         output.push_back(build_responses_function_call_item(
-            tool_call, "completed", fc_item_id));
+            tool_call, valid ? "completed" : "incomplete", fc_item_id));
+        if (!valid) {
+            has_incomplete_tool = true;
+        }
     }
 
     const std::string output_text = build_output_text(output);
-    return build_oai_resp_metadata(oai_resp_id, oaicompat_model, output, output_text,
-        n_prompt_tokens, n_decoded, n_prompt_tokens_cache, "completed");
+    const std::string status = has_incomplete_tool ? "incomplete" : "completed";
+    json resp = build_oai_resp_metadata(oai_resp_id, oaicompat_model, output, output_text,
+        n_prompt_tokens, n_decoded, n_prompt_tokens_cache, status);
+    if (has_incomplete_tool) {
+        resp["incomplete_details"] = json{{"reason", "incomplete_tool_call"}};
+    }
+    return resp;
 }
 
 json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
@@ -788,21 +798,26 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         output_idx++;
     }
 
+    bool has_incomplete_tool = false;
     for (size_t i = 0; i < oaicompat_msg.tool_calls.size(); i++) {
         const auto & tool_call = oaicompat_msg.tool_calls[i];
         const std::string fc_item_id = (i < oai_resp_fc_item_ids.size())
             ? oai_resp_fc_item_ids[i]
             : "fc_" + random_string();
+        const bool valid = tool_call_arguments_valid(tool_call);
 
-        // function_call_arguments.done
-        server_sent_events.push_back(json {{"event", "response.function_call_arguments.done"}, {"data", json{
-            {"type", "response.function_call_arguments.done"}, {"sequence_number", seq_num++},
-            {"output_index", output_idx},
-            {"item_id", fc_item_id}, {"name", tool_call.name},
-        }}});
+        if (valid) {
+            // function_call_arguments.done - only for complete tool calls
+            server_sent_events.push_back(json {{"event", "response.function_call_arguments.done"}, {"data", json{
+                {"type", "response.function_call_arguments.done"}, {"sequence_number", seq_num++},
+                {"output_index", output_idx},
+                {"item_id", fc_item_id}, {"name", tool_call.name},
+            }}});
+        }
 
         const json output_item = {
-            {"id", fc_item_id}, {"type", "function_call"}, {"status", "completed"},
+            {"id", fc_item_id}, {"type", "function_call"},
+            {"status", valid ? "completed" : "incomplete"},
             {"arguments", tool_call.arguments}, {"call_id", "call_" + tool_call.id},
             {"name", tool_call.name},
         };
@@ -812,14 +827,22 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         }}});
         output.push_back(output_item);
         output_idx++;
+        if (!valid) {
+            has_incomplete_tool = true;
+        }
     }
 
     // response.completed
     const std::string output_text = build_output_text(output);
+    const std::string final_status = has_incomplete_tool ? "incomplete" : "completed";
+    json completed_resp = build_oai_resp_metadata(oai_resp_id, oaicompat_model, output, output_text,
+        n_prompt_tokens, n_decoded, n_prompt_tokens_cache, final_status);
+    if (has_incomplete_tool) {
+        completed_resp["incomplete_details"] = json{{"reason", "incomplete_tool_call"}};
+    }
     server_sent_events.push_back(json {{"event", "response.completed"}, {"data", json{
         {"type", "response.completed"}, {"sequence_number", seq_num++},
-        {"response", build_oai_resp_metadata(oai_resp_id, oaicompat_model, output, output_text,
-            n_prompt_tokens, n_decoded, n_prompt_tokens_cache, "completed")},
+        {"response", completed_resp},
     }}});
 
     return server_sent_events;
