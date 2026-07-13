@@ -602,6 +602,7 @@ static json build_oai_resp_metadata(const std::string & oai_resp_id,
         {"model",                oaicompat_model},
         {"object",               "response"},
         {"output",               output},
+        {"output_text",          output_text},
         {"status",               status},
         {"usage",                json {
             {"input_tokens",          n_prompt_tokens},
@@ -610,6 +611,29 @@ static json build_oai_resp_metadata(const std::string & oai_resp_id,
             {"input_tokens_details",  json{{"cached_tokens", n_prompt_tokens_cache}}},
             {"output_tokens_details", json{{"reasoning_tokens", 0}}},
         }},
+        {"incomplete_details",   nullptr},
+        {"previous_response_id", nullptr},
+        {"instructions",         nullptr},
+        {"error",                nullptr},
+        {"tools",                json::array()},
+        {"tool_choice",          "auto"},
+        {"truncation",           "disabled"},
+        {"parallel_tool_calls",  false},
+        {"text",                 json{{"format", json{{"type", "text"}}}}},
+        {"top_p",                1.0},
+        {"presence_penalty",     0.0},
+        {"frequency_penalty",    0.0},
+        {"top_logprobs",         0},
+        {"temperature",          1.0},
+        {"reasoning",            nullptr},
+        {"max_output_tokens",    nullptr},
+        {"max_tool_calls",       nullptr},
+        {"store",                false},
+        {"background",           false},
+        {"service_tier",         "default"},
+        {"safety_identifier",    nullptr},
+        {"prompt_cache_key",     nullptr},
+        {"metadata",             json::object()},
     };
 }
 
@@ -682,27 +706,13 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     std::vector<json> output;
 
     if (msg.reasoning_content != "") {
-        output.push_back(json {
-            {"id",      "rs_" + random_string()},
-            {"summary", json::array()},
-            {"type",    "reasoning"},
-            {"content", json::array({ json {
-                {"text", msg.reasoning_content},
-                {"type", "reasoning_text"},
-            }})},
-            {"encrypted_content", ""},
-            {"status",            "completed"},
-        });
+        output.push_back(build_responses_reasoning_item(
+            "rs_" + random_string(), msg.reasoning_content, "completed"));
     }
 
     if (msg.content != "") {
         output.push_back(json {
-            {"content", json::array({ json {
-                {"type",        "output_text"},
-                {"annotations", json::array()},
-                {"logprobs",    json::array()},
-                {"text",        msg.content},
-            }})},
+            {"content", json::array({build_responses_content_part(msg.content)})},
             {"id",     "msg_" + random_string()},
             {"role",   msg.role},
             {"status", "completed"},
@@ -715,103 +725,67 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         const std::string fc_item_id = (i < oai_resp_fc_item_ids.size())
             ? oai_resp_fc_item_ids[i]
             : "fc_" + random_string();
-        output.push_back(json {
-            {"id",        fc_item_id},
-            {"type",      "function_call"},
-            {"status",    "completed"},
-            {"arguments", tool_call.arguments},
-            {"call_id",   "call_" + tool_call.id},
-            {"name",      tool_call.name},
-        });
+        output.push_back(build_responses_function_call_item(
+            tool_call, "completed", fc_item_id));
     }
 
-    std::time_t t = std::time(0);
-    json res = {
-        {"completed_at", t},
-        {"created_at",   t},
-        {"id",           oai_resp_id},
-        {"model",        oaicompat_model},
-        {"object",       "response"},
-        {"output",       output},
-        {"status",       "completed"},
-        {"usage",        json {
-            {"input_tokens",  n_prompt_tokens},
-            {"output_tokens", n_decoded},
-            {"total_tokens",  n_decoded + n_prompt_tokens},
-            {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
-        }},
-    };
-
-    return res;
+    const std::string output_text = build_output_text(output);
+    return build_oai_resp_metadata(oai_resp_id, oaicompat_model, output, output_text,
+        n_prompt_tokens, n_decoded, n_prompt_tokens_cache, "completed");
 }
 
 json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     std::vector<json> server_sent_events;
     std::vector<json> output;
+    int seq_num = oai_resp_seq_num;
+    int output_idx = 0;
 
     if (oaicompat_msg.reasoning_content != "") {
-        const json output_item = json {
-            {"id",      oai_resp_reasoning_id},
-            {"summary", json::array()},
-            {"type",    "reasoning"},
-            {"content", json::array({ json {
-                {"text", oaicompat_msg.reasoning_content},
-                {"type", "reasoning_text"},
-            }})},
+        const json output_item = {
+            {"id",                oai_resp_reasoning_id},
+            {"summary",           json::array({json{{"type", "summary_text"}, {"text", oaicompat_msg.reasoning_content}}})},
+            {"type",              "reasoning"},
+            {"content",           json::array({json{{"text", oaicompat_msg.reasoning_content}, {"type", "reasoning_text"}}})},
             {"encrypted_content", ""},
+            {"status",            "completed"},
         };
-
-        server_sent_events.push_back(json {
-            {"event", "response.output_item.done"},
-            {"data", json {
-                {"type", "response.output_item.done"},
-                {"item", output_item}
-            }}
-        });
+        server_sent_events.push_back(json {{"event", "response.output_item.done"}, {"data", json{
+            {"type", "response.output_item.done"}, {"sequence_number", seq_num++},
+            {"output_index", output_idx}, {"item", output_item},
+        }}});
         output.push_back(output_item);
+        output_idx++;
     }
 
     if (oaicompat_msg.content != "") {
-        server_sent_events.push_back(json {
-            {"event", "response.output_text.done"},
-            {"data", json {
-                {"type",    "response.output_text.done"},
-                {"item_id", oai_resp_message_id},
-                {"text",    oaicompat_msg.content}
-            }}
-        });
+        server_sent_events.push_back(json {{"event", "response.output_text.done"}, {"data", json{
+            {"type", "response.output_text.done"}, {"sequence_number", seq_num++},
+            {"output_index", output_idx}, {"content_index", 0},
+            {"item_id", oai_resp_message_id}, {"text", oaicompat_msg.content},
+            {"logprobs", json::array()},
+        }}});
 
         const json content_part = {
-            {"type",        "output_text"},
-            {"annotations", json::array()},
-            {"logprobs",    json::array()},
-            {"text",        oaicompat_msg.content}
+            {"type", "output_text"}, {"annotations", json::array()},
+            {"logprobs", json::array()}, {"text", oaicompat_msg.content},
         };
+        server_sent_events.push_back(json {{"event", "response.content_part.done"}, {"data", json{
+            {"type", "response.content_part.done"}, {"sequence_number", seq_num++},
+            {"output_index", output_idx}, {"content_index", 0},
+            {"item_id", oai_resp_message_id}, {"part", content_part},
+        }}});
 
-        server_sent_events.push_back(json {
-            {"event", "response.content_part.done"},
-            {"data", json {
-                {"type",    "response.content_part.done"},
-                {"item_id", oai_resp_message_id},
-                {"part",    content_part}
-            }}
-        });
         const json output_item = {
-            {"type",    "message"},
-            {"status",  "completed"},
-            {"id",      oai_resp_message_id},
-            {"content", json::array({content_part})},
-            {"role",    "assistant"}
+            {"type", "message"}, {"status", "completed"},
+            {"id", oai_resp_message_id},
+            {"content", json::array({content_part})}, {"role", "assistant"},
         };
-
-        server_sent_events.push_back(json {
-            {"event", "response.output_item.done"},
-            {"data", json {
-                {"type", "response.output_item.done"},
-                {"item", output_item}
-            }}
-        });
+        server_sent_events.push_back(json {{"event", "response.output_item.done"}, {"data", json{
+            {"type", "response.output_item.done"}, {"sequence_number", seq_num++},
+            {"output_index", output_idx}, {"item", output_item},
+        }}});
         output.push_back(output_item);
+        output_idx++;
     }
 
     for (size_t i = 0; i < oaicompat_msg.tool_calls.size(); i++) {
@@ -819,49 +793,34 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         const std::string fc_item_id = (i < oai_resp_fc_item_ids.size())
             ? oai_resp_fc_item_ids[i]
             : "fc_" + random_string();
+
+        // function_call_arguments.done
+        server_sent_events.push_back(json {{"event", "response.function_call_arguments.done"}, {"data", json{
+            {"type", "response.function_call_arguments.done"}, {"sequence_number", seq_num++},
+            {"output_index", output_idx},
+            {"item_id", fc_item_id}, {"name", tool_call.name},
+        }}});
+
         const json output_item = {
-            {"id",        fc_item_id},
-            {"type",      "function_call"},
-            {"status",    "completed"},
-            {"arguments", tool_call.arguments},
-            {"call_id",   "call_" + tool_call.id},
-            {"name",      tool_call.name}
+            {"id", fc_item_id}, {"type", "function_call"}, {"status", "completed"},
+            {"arguments", tool_call.arguments}, {"call_id", "call_" + tool_call.id},
+            {"name", tool_call.name},
         };
-        server_sent_events.push_back(json {
-            {"event", "response.output_item.done"},
-            {"data", json {
-                {"type", "response.output_item.done"},
-                {"item", output_item}
-            }}
-        });
+        server_sent_events.push_back(json {{"event", "response.output_item.done"}, {"data", json{
+            {"type", "response.output_item.done"}, {"sequence_number", seq_num++},
+            {"output_index", output_idx}, {"item", output_item},
+        }}});
         output.push_back(output_item);
+        output_idx++;
     }
 
-    std::time_t t = std::time(0);
-    server_sent_events.push_back(json {
-        {"event", "response.completed"},
-        {"data", json {
-            {"type", "response.completed"},
-            {"response", json {
-                {"id",         oai_resp_id},
-                {"object",     "response"},
-                {"created_at", t},
-                {"status",     "completed"},
-                {"model",      oaicompat_model},
-                {"output",     output},
-                {"usage",      json {
-                    {"input_tokens",  n_prompt_tokens},
-                    {"output_tokens", n_decoded},
-                    {"total_tokens",  n_decoded + n_prompt_tokens},
-                    {"input_tokens_details", json { {"cached_tokens", n_prompt_tokens_cache} }},
-                }}
-            }},
-        }}
-    });
-
-    if (timings.prompt_n >= 0) {
-        server_sent_events.back().at("data").push_back({"timings", timings.to_json()});
-    }
+    // response.completed
+    const std::string output_text = build_output_text(output);
+    server_sent_events.push_back(json {{"event", "response.completed"}, {"data", json{
+        {"type", "response.completed"}, {"sequence_number", seq_num++},
+        {"response", build_oai_resp_metadata(oai_resp_id, oaicompat_model, output, output_text,
+            n_prompt_tokens, n_decoded, n_prompt_tokens_cache, "completed")},
+    }}});
 
     return server_sent_events;
 }
