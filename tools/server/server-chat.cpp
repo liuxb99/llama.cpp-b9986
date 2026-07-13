@@ -216,33 +216,115 @@ static std::string compaction_summary_text(const json & item) {
     return result;
 }
 
-static json responses_tool_to_chatcmpl_tool(const json & resp_tool) {
+static std::vector<json> responses_tool_to_chatcmpl_tools(const json & resp_tool) {
+    std::vector<json> result;
     const std::string type = json_value(resp_tool, "type", std::string());
-    if (type != "function") {
+
+    if (type == "function") {
+        json chatcmpl_tool;
+        chatcmpl_tool["type"] = "function";
+        json resp_function = resp_tool;
+
+        if (resp_function.contains("name")) {
+            resp_function["name"] = sanitize_tool_name(resp_function["name"].get<std::string>());
+        }
+        for (const char * key : {"type"}) {
+            resp_function.erase(key);
+        }
+        if (!resp_function.contains("strict")) {
+            resp_function["strict"] = true;
+        }
+        chatcmpl_tool["function"] = resp_function;
+        result.push_back(chatcmpl_tool);
+
+    } else if (type == "namespace") {
+        const std::string ns_name = sanitize_tool_name(
+            json_value(resp_tool, "name", std::string()), "namespace");
+        if (resp_tool.contains("tools") && resp_tool.at("tools").is_array()) {
+            for (const auto & sub : resp_tool.at("tools")) {
+                if (json_value(sub, "type", std::string()) != "function") {
+                    continue;
+                }
+                std::string sub_name = json_value(sub, "name", std::string());
+                if (sub_name.empty()) {
+                    continue;
+                }
+                // Prepend namespace name to avoid conflicts
+                const std::string qualified_name = ns_name + "__" + sanitize_tool_name(sub_name);
+                json fn = sub;
+                fn["name"] = qualified_name;
+                if (!fn.contains("strict")) {
+                    fn["strict"] = false;
+                }
+                json chatcmpl_tool;
+                chatcmpl_tool["type"] = "function";
+                chatcmpl_tool["function"] = fn;
+                result.push_back(chatcmpl_tool);
+            }
+        }
+
+    } else if (type == "custom") {
+        // Convert free-form custom tool to function with string input
+        const std::string name = sanitize_tool_name(
+            json_value(resp_tool, "name", std::string()), "custom_tool");
+        const std::string desc = json_value(resp_tool, "description", std::string());
+        json params = {
+            {"type", "object"},
+            {"properties", json{
+                {"input", json{
+                    {"type", "string"},
+                    {"description", "Free-form input for the custom tool"},
+                }},
+            }},
+            {"required", json::array({"input"})},
+            {"additionalProperties", false},
+        };
+        json chatcmpl_tool;
+        chatcmpl_tool["type"] = "function";
+        chatcmpl_tool["function"] = json {
+            {"name", name},
+            {"description", desc},
+            {"parameters", params},
+            {"strict", false},
+        };
+        result.push_back(chatcmpl_tool);
+
+    } else if (type == "tool_search") {
+        // Convert tool_search to function with search query parameter
+        const std::string desc = json_value(resp_tool, "description", std::string());
+        json params = json_value(resp_tool, "parameters", json::object());
+        if (params.empty()) {
+            params = {
+                {"type", "object"},
+                {"properties", json{
+                    {"query", json{
+                        {"type", "string"},
+                        {"description", "Search query to find relevant tools"},
+                    }},
+                }},
+                {"required", json::array({"query"})},
+                {"additionalProperties", false},
+            };
+        }
+        json chatcmpl_tool;
+        chatcmpl_tool["type"] = "function";
+        chatcmpl_tool["function"] = json {
+            {"name", "tool_search"},
+            {"description", desc},
+            {"parameters", params},
+            {"strict", false},
+        };
+        result.push_back(chatcmpl_tool);
+
+    } else if (type == "web_search") {
+        SRV_WRN("unsupported Responses tool type 'web_search' skipped\n");
+        // web_search has no local backend - skip with warning
+
+    } else {
         SRV_WRN("unsupported Responses tool type '%s' skipped\n", type.c_str());
-        return json();
     }
 
-    json chatcmpl_tool;
-    chatcmpl_tool["type"] = "function";
-    json resp_function = resp_tool;
-
-    // apply sanitize_tool_name
-    if (resp_function.contains("name")) {
-        resp_function["name"] = sanitize_tool_name(resp_function["name"].get<std::string>());
-    }
-
-    // strip Responses-only fields
-    for (const char * key : {"type"}) {
-        resp_function.erase(key);
-    }
-
-    if (!resp_function.contains("strict")) {
-        resp_function["strict"] = true;
-    }
-
-    chatcmpl_tool["function"] = resp_function;
-    return chatcmpl_tool;
+    return result;
 }
 
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
@@ -551,9 +633,9 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_tools.empty()) {
         std::vector<json> chatcmpl_tools;
         for (const json & resp_tool : response_tools) {
-            json chatcmpl_tool = responses_tool_to_chatcmpl_tool(resp_tool);
-            if (!chatcmpl_tool.is_null()) {
-                chatcmpl_tools.push_back(chatcmpl_tool);
+            std::vector<json> converted = responses_tool_to_chatcmpl_tools(resp_tool);
+            for (json & t : converted) {
+                chatcmpl_tools.push_back(std::move(t));
             }
         }
         if (!chatcmpl_tools.empty()) {
