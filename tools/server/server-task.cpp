@@ -445,7 +445,13 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         msg.content = content;
     }
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
-        finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
+        if (msg.tool_calls.empty()) {
+            finish_reason = "stop";
+        } else if (all_tool_call_arguments_valid(msg.tool_calls)) {
+            finish_reason = "tool_calls";
+        } else {
+            finish_reason = "length";
+        }
     }
 
     json choice {
@@ -476,6 +482,11 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
     if (verbose) {
         res["__verbose"] = to_json_non_oaicompat();
     }
+
+    if (finish_reason == "length" && !msg.tool_calls.empty()) {
+        res["__tool_call_incomplete"] = true;
+    }
+
     if (timings.prompt_n >= 0) {
         res.push_back({"timings", timings.to_json()});
     }
@@ -487,7 +498,13 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     std::time_t t = std::time(0);
     std::string finish_reason = "length";
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
-        finish_reason = oaicompat_msg.tool_calls.empty() ? "stop" : "tool_calls";
+        if (oaicompat_msg.tool_calls.empty()) {
+            finish_reason = "stop";
+        } else if (all_tool_call_arguments_valid(oaicompat_msg.tool_calls)) {
+            finish_reason = "tool_calls";
+        } else {
+            finish_reason = "length";
+        }
     }
 
     json deltas = json::array();
@@ -539,6 +556,10 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
 
     if (timings.prompt_n >= 0) {
         deltas.back().push_back({"timings", timings.to_json()});
+    }
+
+    if (finish_reason == "length" && !oaicompat_msg.tool_calls.empty()) {
+        deltas.back()["__tool_call_incomplete"] = true;
     }
 
     // extra fields for debugging purposes

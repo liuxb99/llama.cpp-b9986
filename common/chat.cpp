@@ -2360,16 +2360,29 @@ static void convert_tool_responses_gemma4(json & messages) {
 
 static void func_args_not_string(json & messages) {
     GGML_ASSERT(messages.is_array());
-    for (auto & message : messages) {
+    for (size_t message_index = 0; message_index < messages.size(); message_index++) {
+        auto & message = messages[message_index];
         if (message.contains("tool_calls")) {
-            for (auto & tool_call : message["tool_calls"]) {
+            for (size_t tool_index = 0; tool_index < message["tool_calls"].size(); tool_index++) {
+                auto & tool_call = message["tool_calls"][tool_index];
                 if (tool_call.contains("function") && tool_call["function"].contains("arguments")) {
                     auto & args = tool_call["function"]["arguments"];
                     if (args.is_string()) {
-                        try {
-                            args = json::parse(args.get<std::string>());
-                        } catch (const std::exception & e) {
-                            throw std::runtime_error("Failed to parse tool call arguments as JSON: " + std::string(e.what()));
+                        const std::string raw = args.get<std::string>();
+                        json parsed = json::parse(raw, nullptr, false);
+                        if (!parsed.is_discarded()) {
+                            args = std::move(parsed);
+                        } else {
+                            std::string tool_name;
+                            if (tool_call.contains("function") && tool_call["function"].contains("name")) {
+                                tool_name = tool_call["function"]["name"].get<std::string>();
+                            }
+                            LOG_WRN(
+                                "Malformed tool arguments preserved: message=%zu tool=%zu name='%s' length=%zu\n",
+                                message_index,
+                                tool_index,
+                                tool_name.c_str(),
+                                raw.size());
                         }
                     }
                 }
@@ -2395,6 +2408,23 @@ static void trim_all_content(std::vector<common_chat_msg> & messages) {
     }
 }
 
+}
+
+bool tool_call_arguments_valid(const common_chat_tool_call & tool_call) {
+    if (tool_call.arguments.empty()) {
+        return false;
+    }
+    json parsed = json::parse(tool_call.arguments, nullptr, false);
+    return !parsed.is_discarded() && parsed.is_object();
+}
+
+bool all_tool_call_arguments_valid(const std::vector<common_chat_tool_call> & calls) {
+    for (const auto & call : calls) {
+        if (!tool_call_arguments_valid(call)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // MiniCPM5 format:

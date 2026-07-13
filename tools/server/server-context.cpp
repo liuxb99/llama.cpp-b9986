@@ -39,6 +39,36 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
+// Maximum extra tokens to generate when completing an incomplete tool call
+static const int32_t MAX_TOOL_CALL_EXTRA = 100;
+
+// Returns true if the generated text contains a tool call whose arguments are not yet valid JSON
+// This indicates the model is in the middle of generating a tool call
+static bool has_incomplete_tool_call(const std::string & generated_text, const common_chat_parser_params & parser_params) {
+    if (parser_params.format == COMMON_CHAT_FORMAT_CONTENT_ONLY || !parser_params.parse_tool_calls) {
+        return false;
+    }
+    if (generated_text.empty()) {
+        return false;
+    }
+    try {
+        common_chat_msg msg = common_chat_parse(generated_text, true, parser_params);
+        if (msg.tool_calls.empty()) {
+            return false;
+        }
+        // If any tool call has invalid arguments, we're still generating
+        for (const auto & tc : msg.tool_calls) {
+            if (!tool_call_arguments_valid(tc)) {
+                return true;
+            }
+        }
+    } catch (const std::exception &) {
+        // If parsing throws, don't block generation
+        return false;
+    }
+    return false;
+}
+
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
 
@@ -191,6 +221,8 @@ struct server_slot {
     int32_t n_remaining = -1;
     int32_t i_batch     = -1;
 
+    int32_t n_tool_call_extra = 0; // extra tokens allowed for completing tool calls
+
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
 
@@ -308,6 +340,7 @@ struct server_slot {
         truncated      = false;
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
+        n_tool_call_extra = 0;
         n_sent_text    = 0;
 
         if (can_speculate()) {
@@ -1929,6 +1962,32 @@ private:
 
             SLT_DBG(slot, "%s", "stopped by EOS\n");
         }
+        // If we would stop, check if we are in the middle of generating a tool call
+        // If so, override soft stops to allow the tool call to complete
+        if (!slot.has_next_token && !slot.truncated) {
+            const auto & parser_params = slot.task->params.chat_parser_params;
+            if (has_incomplete_tool_call(slot.generated_text, parser_params)) {
+                if (slot.n_tool_call_extra < MAX_TOOL_CALL_EXTRA) {
+                    slot.n_tool_call_extra++;
+                    slot.has_next_token = true;
+
+                    // Warn when overriding EOS - this may mask a genuine stop signal
+                    const stop_type overridden_stop = slot.stop;
+                    slot.stop           = STOP_TYPE_NONE;
+
+                    if (overridden_stop == STOP_TYPE_EOS) {
+                        SLT_WRN(slot, "overriding EOS to complete tool call (extra_tokens=%d/%d)
+",
+                                slot.n_tool_call_extra, MAX_TOOL_CALL_EXTRA);
+                    } else {
+                        SLT_DBG(slot, "tool call incomplete, continuing generation (extra_tokens=%d/%d)
+",
+                                slot.n_tool_call_extra, MAX_TOOL_CALL_EXTRA);
+                    }
+                }
+            }
+        }
+
 
         SLT_DBG(slot, "n_decoded = %d, n_remaining = %d, next token: %5d '%s'\n", slot.n_decoded, slot.n_remaining, result.tok, token_str.c_str());
 
