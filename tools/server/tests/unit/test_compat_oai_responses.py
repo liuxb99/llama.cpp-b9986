@@ -654,3 +654,149 @@ def test_responses_malformed_assistant_refusal_skipped():
         {"role": "user", "content": [{"type": "input_text", "text": "How are you"}]},
     ])
     assert recovered.body["usage"]["input_tokens"] == baseline.body["usage"]["input_tokens"]
+
+
+def _check_tool_conversion(body, tools_key="tools"):
+    """Helper: check that a Responses request with given tools succeeds."""
+    global server
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
+        "max_output_tokens": 4,
+        "temperature": 0.0,
+        **body,
+    })
+    assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.body}"
+    assert res.body["status"] == "completed"
+
+
+def test_responses_namespace_tool():
+    """Namespace tools are expanded: each sub-tool becomes a function tool."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [{
+            "type": "namespace",
+            "name": "mcp__demo__",
+            "description": "Demo MCP tools",
+            "tools": [
+                {"type": "function", "name": "lookup_order", "description": "Look up order", "parameters": {"type": "object", "properties": {"id": {"type": "string"}}}},
+                {"type": "function", "name": "get_product", "description": "Get product", "parameters": {"type": "object", "properties": {"sku": {"type": "string"}}}},
+            ],
+        }],
+    })
+
+
+def test_responses_namespace_multiple():
+    """Multiple namespaces with same sub-tool name do not conflict."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "namespace", "name": "ns1", "description": "Namespace 1", "tools": [
+                {"type": "function", "name": "tool_a", "description": "Tool A", "parameters": {"type": "object", "properties": {}}},
+            ]},
+            {"type": "namespace", "name": "ns2", "description": "Namespace 2", "tools": [
+                {"type": "function", "name": "tool_a", "description": "Tool A (duplicate name)", "parameters": {"type": "object", "properties": {}}},
+            ]},
+        ],
+    })
+
+
+def test_responses_custom_tool():
+    """Custom (freeform) tools are converted to function tools with string input."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [{
+            "type": "custom",
+            "name": "exec",
+            "description": "Execute a shell command",
+            "format": {"type": "grammar", "syntax": "lark", "definition": "start: "exec""},
+        }],
+    })
+
+
+def test_responses_tool_search_tool():
+    """Tool search tools are converted to function tools with query params."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [{
+            "type": "tool_search",
+            "execution": "sync",
+            "description": "Search for tools",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+        }],
+    })
+
+
+def test_responses_web_search_skipped():
+    """Web search tools are skipped but do not block other tools."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "web_search"},
+            {"type": "function", "name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
+        ],
+    })
+
+
+def test_responses_all_tool_types_mixed():
+    """Mixed function/namespace/custom/tool_search/web_search all work together."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "function", "name": "get_weather", "description": "Get weather", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
+            {"type": "namespace", "name": "mcp", "description": "MCP", "tools": [
+                {"type": "function", "name": "read_file", "description": "Read file", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
+            ]},
+            {"type": "custom", "name": "exec", "description": "Shell", "format": {"type": "grammar", "syntax": "lark", "definition": "start: "exec""}},
+            {"type": "tool_search", "execution": "sync", "description": "Search", "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}},
+            {"type": "web_search"},
+        ],
+    })
+
+
+def test_responses_namespace_empty_tools():
+    """A namespace with no tools array produces no tools (no crash)."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [{"type": "namespace", "name": "empty_ns", "description": "Empty"}],
+    })
+
+
+def test_responses_namespace_missing_name():
+    """A namespace without a name uses default 'namespace' prefix."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [{"type": "namespace", "description": "No name", "tools": [
+            {"type": "function", "name": "orphan_tool", "description": "Orphan", "parameters": {"type": "object", "properties": {}}},
+        ]}],
+    })
+
+
+def test_responses_namespace_no_function_skipped():
+    """Namespace sub-tools that are not 'function' type are skipped."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [{"type": "namespace", "name": "ns", "description": "NS", "tools": [
+            {"type": "web_search"},  # skipped
+            {"type": "function", "name": "real_tool", "description": "Real", "parameters": {"type": "object", "properties": {}}},
+        ]}],
+    })
+
+
+def test_responses_custom_no_description():
+    """Custom tool without description still works."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [{"type": "custom", "name": "apply_patch", "description": "Apply a patch"},
+                  {"type": "custom", "name": "read_file", "description": "Read file contents"}],
+    })
