@@ -1168,21 +1168,37 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
 
     if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !state.oai_resp_created && (is_progress || n_decoded == 1)) {
         state.oai_resp_created = true;
+        state.oai_resp_seq_num += 2; // response.created + response.in_progress
     }
 
     // Pre-compute state updates based on diffs (for next chunk)
     for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
-        if (!diff.reasoning_content_delta.empty() && !state.thinking_block_started) {
-            state.thinking_block_started = true;
+        if (!diff.reasoning_content_delta.empty()) {
+            if (!state.thinking_block_started) {
+                state.thinking_block_started = true;
+                state.oai_resp_seq_num++; // output_item.added
+                state.oai_resp_output_idx++;
+            }
+            state.oai_resp_seq_num++; // reasoning_text.delta
         }
-        if (!diff.content_delta.empty() && !state.text_block_started) {
-            state.text_block_started = true;
+        if (!diff.content_delta.empty()) {
+            if (!state.text_block_started) {
+                state.text_block_started = true;
+                state.oai_resp_seq_num += 2; // output_item.added + content_part.added
+                state.oai_resp_output_idx++;
+            }
+            state.oai_resp_seq_num++; // output_text.delta
         }
         if (!diff.tool_call_delta.name.empty()) {
             state.oai_resp_fc_id = diff.tool_call_delta.id;
             // Generate stable fc_ item ID for this tool call
             state.oai_resp_fc_item_id = "fc_" + random_string();
             state.oai_resp_fc_item_ids.push_back(state.oai_resp_fc_item_id);
+            state.oai_resp_seq_num++; // output_item.added
+            state.oai_resp_output_idx++;
+        }
+        if (!diff.tool_call_delta.arguments.empty()) {
+            state.oai_resp_seq_num++; // function_call_arguments.delta
         }
     }
 }
@@ -1330,78 +1346,77 @@ json server_task_result_cmpl_partial::to_json_oaicompat_chat() {
 json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
     std::vector<json> events;
 
+    int seq_num = oai_resp_seq_num;
+    int output_idx = oai_resp_output_idx;
+    auto add_seq = [&](json & data) {
+        data["sequence_number"] = seq_num++;
+    };
+
     if (!oai_resp_created) {
-        events.push_back(json {
-            {"event", "response.created"},
-            {"data", json {
-                {"type", "response.created"},
-                {"response", json {
-                    {"id",     oai_resp_id},
-                    {"object", "response"},
-                    {"status", "in_progress"},
-                }},
-            }},
-        });
-        events.push_back(json {
-            {"event", "response.in_progress"},
-            {"data", json {
-                {"type", "response.in_progress"},
-                {"response", json {
-                    {"id",     oai_resp_id},
-                    {"object", "response"},
-                    {"status", "in_progress"},
-                }},
-            }},
-        });
+        json data = {{"type", "response.created"}};
+        add_seq(data);
+        data["response"] = json {{
+            {"id",     oai_resp_id},
+            {"object", "response"},
+            {"status", "in_progress"},
+        }};
+        events.push_back({{"event", "response.created"}, {"data", data}});
+
+        data = {{"type", "response.in_progress"}};
+        add_seq(data);
+        data["response"] = json {{
+            {"id",     oai_resp_id},
+            {"object", "response"},
+            {"status", "in_progress"},
+        }};
+        events.push_back({{"event", "response.in_progress"}, {"data", data}});
     } else if (is_progress) {
-        events.push_back(json {
-            {"event", "response.in_progress"},
-            {"data", json {
-                {"type", "response.in_progress"},
-                {"response", json {
-                    {"id",     oai_resp_id},
-                    {"object", "response"},
-                    {"status", "in_progress"},
-                }},
-            }},
-        });
+        json data = {{"type", "response.in_progress"}};
+        add_seq(data);
+        data["response"] = json {{
+            {"id",     oai_resp_id},
+            {"object", "response"},
+            {"status", "in_progress"},
+        }};
+        events.push_back({{"event", "response.in_progress"}, {"data", data}});
     }
 
     for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
         if (!diff.reasoning_content_delta.empty()) {
             if (!thinking_block_started) {
-                events.push_back(json {
-                    {"event", "response.output_item.added"},
-                    {"data", json {
-                        {"type", "response.output_item.added"},
-                        {"item", json {
-                            {"id",                oai_resp_reasoning_id},
-                            {"summary",           json::array()},
-                            {"type",              "reasoning"},
-                            {"content",           json::array()},
-                            {"encrypted_content", ""},
-                            {"status",            "in_progress"},
-                        }},
+                json data = {
+                    {"type",  "response.output_item.added"},
+                    {"output_index", output_idx},
+                    {"item", json {
+                        {"id",                oai_resp_reasoning_id},
+                        {"summary",           json::array()},
+                        {"type",              "reasoning"},
+                        {"content",           json::array()},
+                        {"encrypted_content", ""},
+                        {"status",            "in_progress"},
                     }},
-                });
+                };
+                add_seq(data);
+                events.push_back({{"event", "response.output_item.added"}, {"data", data}});
                 thinking_block_started = true;
             }
-            events.push_back(json {
-                {"event", "response.reasoning_text.delta"},
-                {"data", json {
+            {
+                json data = {
                     {"type",    "response.reasoning_text.delta"},
                     {"delta",   diff.reasoning_content_delta},
                     {"item_id", oai_resp_reasoning_id},
-                }},
-            });
+                };
+                add_seq(data);
+                events.push_back({{"event", "response.reasoning_text.delta"}, {"data", data}});
+            }
         }
 
         if (!diff.content_delta.empty()) {
             if (!text_block_started) {
-                events.push_back(json {
-                    {"event", "response.output_item.added"},
-                    {"data", json {
-                        {"type", "response.output_item.added"},
+                {
+                    json data = {
+                        {"type",  "response.output_item.added"},
+                        {"output_index", output_idx},
                         {"item", json {
                             {"content", json::array()},
                             {"id",      oai_resp_message_id},
@@ -1409,49 +1424,57 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                             {"status",  "in_progress"},
                             {"type",    "message"},
                         }},
-                    }},
-                });
-                events.push_back(json {
-                    {"event", "response.content_part.added"},
-                    {"data", json {
+                    };
+                    add_seq(data);
+                    events.push_back({{"event", "response.output_item.added"}, {"data", data}});
+                }
+                {
+                    json data = {
                         {"type",    "response.content_part.added"},
+                        {"output_index", output_idx},
+                        {"content_index", 0},
                         {"item_id", oai_resp_message_id},
                         {"part", json {
                             {"type", "output_text"},
                             {"text", ""},
                         }},
-                    }},
-                });
+                    };
+                    add_seq(data);
+                    events.push_back({{"event", "response.content_part.added"}, {"data", data}});
+                }
                 text_block_started = true;
             }
-            events.push_back(json {
-                {"event", "response.output_text.delta"},
-                {"data", json {
+            {
+                json data = {
                     {"type",    "response.output_text.delta"},
+                    {"output_index", output_idx},
+                    {"content_index", 0},
                     {"item_id", oai_resp_message_id},
                     {"delta",   diff.content_delta},
-                }},
-            });
+                };
+                add_seq(data);
+                events.push_back({{"event", "response.output_text.delta"}, {"data", data}});
+            }
         }
 
         if (!diff.tool_call_delta.name.empty()) {
             const std::string fc_item_id = oai_resp_fc_item_id.empty()
                 ? "fc_" + random_string()
                 : oai_resp_fc_item_id;
-            events.push_back(json {
-                {"event", "response.output_item.added"},
-                {"data", json {
-                    {"type",  "response.output_item.added"},
-                    {"item", json {
-                        {"id",        fc_item_id},
-                        {"arguments", ""},
-                        {"call_id",   "call_" + diff.tool_call_delta.id},
-                        {"name",      diff.tool_call_delta.name},
-                        {"type",      "function_call"},
-                        {"status",    "in_progress"},
-                    }},
+            json data = {
+                {"type",  "response.output_item.added"},
+                {"output_index", output_idx},
+                {"item", json {
+                    {"id",        fc_item_id},
+                    {"arguments", ""},
+                    {"call_id",   "call_" + diff.tool_call_delta.id},
+                    {"name",      diff.tool_call_delta.name},
+                    {"type",      "function_call"},
+                    {"status",    "in_progress"},
                 }},
-            });
+            };
+            add_seq(data);
+            events.push_back({{"event", "response.output_item.added"}, {"data", data}});
             oai_resp_fc_id = diff.tool_call_delta.id;
         }
 
@@ -1459,14 +1482,14 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
             const std::string fc_item_id = oai_resp_fc_item_id.empty()
                 ? "fc_" + oai_resp_fc_id
                 : oai_resp_fc_item_id;
-            events.push_back(json {
-                {"event", "response.function_call_arguments.delta"},
-                {"data", json {
-                    {"type",    "response.function_call_arguments.delta"},
-                    {"delta",   diff.tool_call_delta.arguments},
-                    {"item_id", fc_item_id},
-                }},
-            });
+            json data = {
+                {"type",    "response.function_call_arguments.delta"},
+                {"delta",   diff.tool_call_delta.arguments},
+                {"item_id", fc_item_id},
+                {"output_index", output_idx},
+            };
+            add_seq(data);
+            events.push_back({{"event", "response.function_call_arguments.delta"}, {"data", data}});
         }
     }
 
