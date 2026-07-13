@@ -570,6 +570,106 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat_stream() {
     return deltas;
 }
 
+// Helper functions for Responses API SSE formatting
+
+static std::string build_output_text(const std::vector<json> & output) {
+    std::string result;
+    for (const auto & item : output) {
+        if (json_value(item, "type", std::string()) == "message") {
+            for (const auto & part : item.at("content")) {
+                if (json_value(part, "type", std::string()) == "output_text") {
+                    result += part.at("text").get<std::string>();
+                }
+            }
+        }
+    }
+    return result;
+}
+
+static json build_oai_resp_metadata(const std::string & oai_resp_id,
+                                    const std::string & oaicompat_model,
+                                    const std::vector<json> & output,
+                                    const std::string & output_text,
+                                    int n_prompt_tokens,
+                                    int n_decoded,
+                                    int n_prompt_tokens_cache,
+                                    const std::string & status = "completed") {
+    std::time_t t = std::time(0);
+    return json {
+        {"completed_at",         status == "completed" ? json(t) : json(nullptr)},
+        {"created_at",           t},
+        {"id",                   oai_resp_id},
+        {"model",                oaicompat_model},
+        {"object",               "response"},
+        {"output",               output},
+        {"status",               status},
+        {"usage",                json {
+            {"input_tokens",          n_prompt_tokens},
+            {"output_tokens",         n_decoded},
+            {"total_tokens",          n_decoded + n_prompt_tokens},
+            {"input_tokens_details",  json{{"cached_tokens", n_prompt_tokens_cache}}},
+            {"output_tokens_details", json{{"reasoning_tokens", 0}}},
+        }},
+    };
+}
+
+static json build_responses_function_call_item(
+        const common_chat_tool_call & tool_call,
+        const std::string & status,
+        const std::string & item_id) {
+    return json {
+        {"type",      "function_call"},
+        {"id",        item_id.empty() ? "fc_" + tool_call.id : item_id},
+        {"call_id",   "call_" + tool_call.id},
+        {"name",      tool_call.name},
+        {"arguments", tool_call.arguments},
+        {"status",    status},
+    };
+}
+
+static json build_responses_reasoning_item(const std::string & id, const std::string & text, const std::string & status) {
+    json item = {
+        {"id",                id},
+        {"summary",           json::array()},
+        {"type",              "reasoning"},
+        {"content",           json::array()},
+        {"encrypted_content", ""},
+        {"status",            status},
+    };
+    if (!text.empty()) {
+        item["summary"].push_back({{"type", "summary_text"}, {"text", text}});
+        item["content"].push_back({{"type", "reasoning_text"}, {"text", text}});
+    }
+    return item;
+}
+
+static json build_responses_content_part(const std::string & text) {
+    return json {
+        {"type", "output_text"}, {"annotations", json::array()},
+        {"logprobs", json::array()}, {"text", text},
+    };
+}
+
+static json build_responses_message_item(const std::string & id, const common_chat_msg & msg, const bool has_tool_calls) {
+    return json {
+        {"content", json::array({build_responses_content_part(msg.content)})},
+        {"id",     id},
+        {"status", "completed"},
+        {"type",   "message"},
+    };
+}
+
+static json build_responses_sse(const char * event, int & seq_num, const json & fields) {
+    json data = {
+        {"type",            event},
+        {"sequence_number", seq_num++},
+    };
+    for (const auto & field : fields.items()) {
+        data[field.key()] = field.value();
+    }
+    return json {{"event", event}, {"data", data}};
+}
+
 json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     common_chat_msg msg;
     if (!oaicompat_msg.empty()) {
@@ -610,9 +710,13 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         });
     }
 
-    for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
+    for (size_t i = 0; i < oaicompat_msg.tool_calls.size(); i++) {
+        const auto & tool_call = oaicompat_msg.tool_calls[i];
+        const std::string fc_item_id = (i < oai_resp_fc_item_ids.size())
+            ? oai_resp_fc_item_ids[i]
+            : "fc_" + random_string();
         output.push_back(json {
-            {"id",        "fc_" + tool_call.id},
+            {"id",        fc_item_id},
             {"type",      "function_call"},
             {"status",    "completed"},
             {"arguments", tool_call.arguments},
@@ -710,9 +814,13 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         output.push_back(output_item);
     }
 
-    for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
+    for (size_t i = 0; i < oaicompat_msg.tool_calls.size(); i++) {
+        const auto & tool_call = oaicompat_msg.tool_calls[i];
+        const std::string fc_item_id = (i < oai_resp_fc_item_ids.size())
+            ? oai_resp_fc_item_ids[i]
+            : "fc_" + random_string();
         const json output_item = {
-            {"id",        "fc_" + tool_call.id},
+            {"id",        fc_item_id},
             {"type",      "function_call"},
             {"status",    "completed"},
             {"arguments", tool_call.arguments},
@@ -1046,6 +1154,14 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     oai_resp_reasoning_id  = state.oai_resp_reasoning_id;
     oai_resp_message_id    = state.oai_resp_message_id;
     oai_resp_fc_id         = state.oai_resp_fc_id;
+    oai_resp_fc_item_id    = state.oai_resp_fc_item_id;
+    oai_resp_seq_num       = state.oai_resp_seq_num;
+    oai_resp_output_idx    = state.oai_resp_output_idx;
+    oai_resp_reasoning_output_idx = state.oai_resp_reasoning_output_idx;
+    oai_resp_reasoning_done       = state.oai_resp_reasoning_done;
+    oai_resp_message_done         = state.oai_resp_message_done;
+    oai_resp_reasoning_content    = state.chat_msg.reasoning_content;
+    oai_resp_message_content      = state.chat_msg.content;
 
     // track if the accumulated message has any reasoning content
     anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
@@ -1064,6 +1180,9 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
         }
         if (!diff.tool_call_delta.name.empty()) {
             state.oai_resp_fc_id = diff.tool_call_delta.id;
+            // Generate stable fc_ item ID for this tool call
+            state.oai_resp_fc_item_id = "fc_" + random_string();
+            state.oai_resp_fc_item_ids.push_back(state.oai_resp_fc_item_id);
         }
     }
 }
@@ -1316,12 +1435,15 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
         }
 
         if (!diff.tool_call_delta.name.empty()) {
+            const std::string fc_item_id = oai_resp_fc_item_id.empty()
+                ? "fc_" + random_string()
+                : oai_resp_fc_item_id;
             events.push_back(json {
                 {"event", "response.output_item.added"},
                 {"data", json {
                     {"type",  "response.output_item.added"},
                     {"item", json {
-                        {"id",        "fc_" + diff.tool_call_delta.id},
+                        {"id",        fc_item_id},
                         {"arguments", ""},
                         {"call_id",   "call_" + diff.tool_call_delta.id},
                         {"name",      diff.tool_call_delta.name},
@@ -1334,12 +1456,15 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
         }
 
         if (!diff.tool_call_delta.arguments.empty()) {
+            const std::string fc_item_id = oai_resp_fc_item_id.empty()
+                ? "fc_" + oai_resp_fc_id
+                : oai_resp_fc_item_id;
             events.push_back(json {
                 {"event", "response.function_call_arguments.delta"},
                 {"data", json {
                     {"type",    "response.function_call_arguments.delta"},
                     {"delta",   diff.tool_call_delta.arguments},
-                    {"item_id", "fc_" + oai_resp_fc_id},
+                    {"item_id", fc_item_id},
                 }},
             });
         }
