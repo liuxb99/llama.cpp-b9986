@@ -1963,27 +1963,20 @@ private:
             SLT_DBG(slot, "%s", "stopped by EOS\n");
         }
         // If we would stop, check if we are in the middle of generating a tool call
-        // If so, override soft stops to allow the tool call to complete
-        if (!slot.has_next_token && !slot.truncated) {
+        // If so, override soft stops (except EOS) to allow the tool call to complete
+        if (!slot.has_next_token && !slot.truncated && slot.stop != STOP_TYPE_EOS) {
             const auto & parser_params = slot.task->params.chat_parser_params;
             if (has_incomplete_tool_call(slot.generated_text, parser_params)) {
                 if (slot.n_tool_call_extra < MAX_TOOL_CALL_EXTRA) {
                     slot.n_tool_call_extra++;
                     slot.has_next_token = true;
-
-                    // Warn when overriding EOS - this may mask a genuine stop signal
-                    const stop_type overridden_stop = slot.stop;
                     slot.stop           = STOP_TYPE_NONE;
 
-                    if (overridden_stop == STOP_TYPE_EOS) {
-                        SLT_WRN(slot, "overriding EOS to complete tool call (extra_tokens=%d/%d)
-",
-                                slot.n_tool_call_extra, MAX_TOOL_CALL_EXTRA);
-                    } else {
-                        SLT_DBG(slot, "tool call incomplete, continuing generation (extra_tokens=%d/%d)
-",
-                                slot.n_tool_call_extra, MAX_TOOL_CALL_EXTRA);
-                    }
+                    SLT_DBG(
+                        slot,
+                        "tool call incomplete, continuing generation (extra_tokens=%d/%d)\n",
+                        slot.n_tool_call_extra,
+                        MAX_TOOL_CALL_EXTRA);
                 }
             }
         }
