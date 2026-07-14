@@ -1545,23 +1545,43 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
 
             // Append minimal tool output format hint to system prompt
             // (only once per conversation — checked by marker string)
-            static const char * TOOL_CALL_HINT =
-                "\n\nWhen calling a tool, output exactly:\n"
+            // Does NOT modify existing system message content (which may be array).
+            // Instead, appends a new system message with just the hint.
+            static const char * TOOL_CALL_HINT_TEXT =
+                "When calling a tool, output exactly:\n"
                 "<tool_call>tool_name{\"key\":\"value\"}</tool_call>\n"
                 "Never place Markdown code fences inside <tool_call>.";
 
             auto & messages = chatcmpl_body["messages"];
-            if (messages.is_array() && !messages.empty() && messages[0].value("role", "") == "system") {
-                std::string content = messages[0].value("content", std::string());
-                if (content.find("<tool_call>tool_name") == std::string::npos) {
-                    messages[0]["content"] = content + TOOL_CALL_HINT;
+            bool hint_exists = false;
+            if (messages.is_array()) {
+                for (const auto & msg : messages) {
+                    if (msg.value("role", "") != "system") continue;
+                    const auto & content = msg["content"];
+                    if (content.is_string()) {
+                        if (content.get_ref<const std::string &>().find("<tool_call>tool_name") != std::string::npos) {
+                            hint_exists = true;
+                            break;
+                        }
+                    } else if (content.is_array()) {
+                        for (const auto & part : content) {
+                            if (part.is_object() && part.value("type", "") == "text") {
+                                if (part.value("text", std::string()).find("<tool_call>tool_name") != std::string::npos) {
+                                    hint_exists = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (hint_exists) break;
+                    }
                 }
-            } else {
-                // No existing system prompt — create one with the hint
-                json sys_msg;
-                sys_msg["role"]    = "system";
-                sys_msg["content"] = std::string(TOOL_CALL_HINT + 2); // skip leading \n\n
-                messages.array().insert(messages.array().begin(), sys_msg);
+            }
+
+            if (!hint_exists) {
+                json hint_msg;
+                hint_msg["role"]    = "system";
+                hint_msg["content"] = std::string(TOOL_CALL_HINT_TEXT);
+                messages.push_back(hint_msg);
             }
         }
     }

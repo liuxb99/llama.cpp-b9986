@@ -2183,7 +2183,7 @@ static void test_convert_responses_to_chatcmpl() {
 
     // === Tool output format hint tests ===
 
-    // Test 1: Responses with tool_map → hint present in system message
+    // Test 1: Responses with tool_map + string system → hint appended as new system msg
     {
         json input = json::parse(R"({
             "input": "Hello",
@@ -2213,18 +2213,24 @@ static void test_convert_responses_to_chatcmpl() {
         // Tool map present
         assert_equals(true, result.contains("__responses_tool_map"));
 
-        // System message exists with hint appended
+        // Messages: [system(instructions), user, system(hint)]
         assert_equals(true, result.contains("messages"));
         auto & msgs = result["messages"];
         assert_equals(true, msgs.is_array());
-        assert_equals((size_t)2, msgs.size());
+        assert_equals((size_t)3, msgs.size());
+
+        // Original system message unchanged
         assert_equals(std::string("system"), msgs[0]["role"].get<std::string>());
-        std::string sys_content = msgs[0]["content"].get<std::string>();
-        assert_equals(true, sys_content.find("<tool_call>tool_name") != std::string::npos);
-        assert_equals(true, sys_content.find("Never place Markdown code fences inside <tool_call>") != std::string::npos);
+        assert_equals(std::string("You are a helpful assistant."), msgs[0]["content"].get<std::string>());
+
+        // Last message is system with hint
+        assert_equals(std::string("system"), msgs[2]["role"].get<std::string>());
+        std::string hint_content = msgs[2]["content"].get<std::string>();
+        assert_equals(true, hint_content.find("<tool_call>tool_name") != std::string::npos);
+        assert_equals(true, hint_content.find("Never place Markdown code fences inside <tool_call>") != std::string::npos);
     }
 
-    // Test 2: Responses without tool_map → no hint
+    // Test 2: Responses without tool_map → no hint added
     {
         json input = json::parse(R"({
             "input": "Hello",
@@ -2236,15 +2242,17 @@ static void test_convert_responses_to_chatcmpl() {
 
         assert_equals(false, result.contains("tools"));
         assert_equals(false, result.contains("__responses_tool_map"));
+        // Only 2 messages: system + user
+        assert_equals((size_t)2, result["messages"].size());
         std::string sys_content = result["messages"][0]["content"].get<std::string>();
-        assert_equals(std::string("Be helpful."), sys_content); // unchanged
+        assert_equals(std::string("Be helpful."), sys_content);
     }
 
-    // Test 3: Multi-turn — hint not duplicated when already present
+    // Test 3: Multi-turn — hint not duplicated (already in string content)
     {
         json input = json::parse(R"({
             "input": "Hello",
-            "instructions": "You are a helpful assistant.\n\nWhen calling a tool, output exactly:\n<tool_call>tool_name{\"key\":\"value\"}</tool_call>\nNever place Markdown code fences inside <tool_call>.",
+            "instructions": "You are helpful.\nWhen calling a tool, output exactly:\n<tool_call>tool_name{\"key\":\"value\"}</tool_call>\nNever place Markdown code fences inside <tool_call>.",
             "model": "test-model",
             "tools": [
                 {
@@ -2264,11 +2272,8 @@ static void test_convert_responses_to_chatcmpl() {
 
         json result = server_chat_convert_responses_to_chatcmpl(input);
 
-        // Hint should appear exactly once
-        std::string sys_content = result["messages"][0]["content"].get<std::string>();
-        size_t first = sys_content.find("<tool_call>tool_name");
-        size_t last  = sys_content.rfind("<tool_call>tool_name");
-        assert_equals(first, last); // only one occurrence
+        // Only 2 messages: system + user (no extra hint msg)
+        assert_equals((size_t)2, result["messages"].size());
     }
 
     // Test 4: No system prompt but tools present → hint system message created
@@ -2294,14 +2299,81 @@ static void test_convert_responses_to_chatcmpl() {
 
         json result = server_chat_convert_responses_to_chatcmpl(input);
 
-        // A system message with the hint should be prepended
+        // Messages: [user, system(hint)]
         assert_equals(true, result.contains("messages"));
         auto & msgs = result["messages"];
         assert_equals(true, msgs.is_array());
-        assert_equals(true, msgs.size() >= 1);
-        assert_equals(std::string("system"), msgs[0]["role"].get<std::string>());
-        std::string sys_content = msgs[0]["content"].get<std::string>();
-        assert_equals(true, sys_content.find("<tool_call>tool_name") != std::string::npos);
+        assert_equals((size_t)2, msgs.size());
+        assert_equals(std::string("user"), msgs[0]["role"].get<std::string>());
+        assert_equals(std::string("system"), msgs[1]["role"].get<std::string>());
+        std::string hint_content = msgs[1]["content"].get<std::string>();
+        assert_equals(true, hint_content.find("<tool_call>tool_name") != std::string::npos);
+    }
+
+    // Test 5: System content is array — hint appended, original array unchanged
+    {
+        json input = json::parse(R"({
+            "input": "Hello",
+            "instructions": [{"type":"text","text":"Be helpful."}],
+            "model": "test-model",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "loc": {"type": "string"}
+                        },
+                        "required": ["loc"]
+                    }
+                }
+            ]
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        // Messages: [system(original array), user, system(hint)]
+        assert_equals((size_t)3, result["messages"].size());
+
+        // Original system message content is still array
+        assert_equals(true, result["messages"][0]["content"].is_array());
+        assert_equals(std::string("text"), result["messages"][0]["content"][0]["type"].get<std::string>());
+        assert_equals(std::string("Be helpful."), result["messages"][0]["content"][0]["text"].get<std::string>());
+
+        // Hint appended as separate system message
+        assert_equals(std::string("system"), result["messages"][2]["role"].get<std::string>());
+        std::string hint_content = result["messages"][2]["content"].get<std::string>();
+        assert_equals(true, hint_content.find("<tool_call>tool_name") != std::string::npos);
+    }
+
+    // Test 6: System content is array that already contains hint text in a part
+    {
+        json input = json::parse(R"({
+            "input": "Hello",
+            "instructions": [{"type":"text","text":"Be helpful.\nWhen calling a tool, output exactly:\n<tool_call>tool_name{\"key\":\"value\"}</tool_call>\nNever place Markdown code fences inside <tool_call>."}],
+            "model": "test-model",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "loc": {"type": "string"}
+                        },
+                        "required": ["loc"]
+                    }
+                }
+            ]
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        // Only 2 messages: system(orig) + user — hint already in array part, not duplicated
+        assert_equals((size_t)2, result["messages"].size());
     }
 }
 
