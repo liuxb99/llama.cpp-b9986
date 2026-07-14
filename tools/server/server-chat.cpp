@@ -1000,15 +1000,15 @@ static void dump_responses_tools(const json & response_body) {
             auto it = tool_map.find(map_key);
             if (it != tool_map.end()) {
                 md << "- **Map Key**: `" << map_key << "`\n";
-                md << "- **Original Type**: `" << json_value(it->second, "original_type", std::string()) << "`\n";
-                md << "- **Original Name**: `" << json_value(it->second, "original_name", std::string()) << "`\n";
+                md << "- **Original Type**: `" << json_value(it.value(), "original_type", std::string()) << "`\n";
+                md << "- **Original Name**: `" << json_value(it.value(), "original_name", std::string()) << "`\n";
             }
         } else {
             auto it = tool_map.find(map_key);
             if (it != tool_map.end()) {
                 md << "- **Map Key**: `" << map_key << "`\n";
-                md << "- **Original Type**: `" << json_value(it->second, "original_type", std::string()) << "`\n";
-                md << "- **Original Name**: `" << json_value(it->second, "original_name", std::string()) << "`\n";
+                md << "- **Original Type**: `" << json_value(it.value(), "original_type", std::string()) << "`\n";
+                md << "- **Original Name**: `" << json_value(it.value(), "original_name", std::string()) << "`\n";
             }
         }
 
