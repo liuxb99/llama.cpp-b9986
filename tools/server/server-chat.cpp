@@ -497,6 +497,144 @@ static json find_web_search_replacement(
     return json();
 }
 
+bool parse_xml_tool_call_fallback(
+    const std::string & raw_text,
+    bool is_partial,
+    const std::string & gen_prompt,
+    common_chat_msg & msg) {
+    std::string text = raw_text;
+    if (!gen_prompt.empty() && text.substr(0, gen_prompt.size()) == gen_prompt) {
+        text = text.substr(gen_prompt.size());
+    }
+
+    if (text.find("<tool_call>") == std::string::npos) {
+        return false;
+    }
+
+    // Build clean content without <tool_call>...</tool_call> sections
+    std::string clean_content;
+    std::vector<common_chat_tool_call> calls;
+
+    size_t pos = 0;
+
+    while (true) {
+        size_t ts = text.find("<tool_call>", pos);
+        if (ts == std::string::npos) {
+            clean_content += text.substr(pos);
+            break;
+        }
+
+        // Add text before <tool_call>
+        if (ts > pos) {
+            clean_content += text.substr(pos, ts - pos);
+        }
+
+        size_t tag_end_start = text.find("</tool_call>", ts);
+
+        std::string inner;
+        if (tag_end_start != std::string::npos) {
+            inner = text.substr(ts + 11, tag_end_start - ts - 11);
+            pos = tag_end_start + 12;
+        } else {
+            inner = text.substr(ts + 11);
+            pos = text.size();
+        }
+
+        // Trim whitespace
+        size_t first = inner.find_first_not_of(" \t\n\r");
+        if (first != std::string::npos) {
+            inner = inner.substr(first);
+        }
+        size_t last = inner.find_last_not_of(" \t\n\r");
+        if (last != std::string::npos && last + 1 < inner.size()) {
+            inner = inner.substr(0, last + 1);
+        }
+
+        if (inner.empty()) {
+            continue;
+        }
+
+        common_chat_tool_call call;
+        bool parsed = false;
+
+        // Format A: name{json}  or  name{json}name{json}  (parallel)
+        if (std::isalpha(static_cast<unsigned char>(inner[0])) || inner[0] == '_') {
+            size_t ci = 0;
+            while (ci < inner.size()) {
+                // Read name
+                size_t name_start = ci;
+                while (ci < inner.size() && (std::isalnum(static_cast<unsigned char>(inner[ci])) || inner[ci] == '_' || inner[ci] == '-' || inner[ci] == '.')) {
+                    ci++;
+                }
+                if (ci == name_start) { ci++; continue; }
+                common_chat_tool_call sub_call;
+                sub_call.name = inner.substr(name_start, ci - name_start);
+
+                // Skip whitespace before JSON
+                while (ci < inner.size() && (inner[ci] == ' ' || inner[ci] == '\t' || inner[ci] == '\n' || inner[ci] == '\r')) {
+                    ci++;
+                }
+
+                if (ci < inner.size() && inner[ci] == '{') {
+                    int depth = 0;
+                    size_t json_start = ci;
+                    size_t json_end = std::string::npos;
+                    for (; ci < inner.size(); ci++) {
+                        if (inner[ci] == '{') depth++;
+                        else if (inner[ci] == '}') {
+                            depth--;
+                            if (depth == 0) {
+                                json_end = ci;
+                                ci++;
+                                break;
+                            }
+                        }
+                    }
+                    if (json_end != std::string::npos) {
+                        sub_call.arguments = inner.substr(json_start, json_end - json_start + 1);
+                    } else if (is_partial) {
+                        sub_call.arguments = inner.substr(json_start);
+                    }
+                }
+
+                if (!sub_call.name.empty()) {
+                    if (!sub_call.arguments.empty()) {
+                        auto parsed_json = json::parse(sub_call.arguments, nullptr, false);
+                        if (!parsed_json.is_discarded() || is_partial) {
+                            calls.push_back(std::move(sub_call));
+                            parsed = true;
+                        }
+                    } else if (is_partial) {
+                        calls.push_back(std::move(sub_call));
+                        parsed = true;
+                    }
+                }
+            }
+        }
+
+        // Format B: {"name":"...", "arguments":{...}}
+        if (!parsed && !inner.empty() && inner[0] == '{') {
+            auto parsed_json = json::parse(inner, nullptr, false);
+            if (!parsed_json.is_discarded() && parsed_json.is_object()) {
+                call.name = json_value(parsed_json, "name", std::string());
+                if (!call.name.empty()) {
+                    const json & args = parsed_json["arguments"];
+                    call.arguments = args.dump();
+                    calls.push_back(std::move(call));
+                    parsed = true;
+                }
+            }
+        }
+    }
+
+    msg.content = clean_content;
+    if (!calls.empty()) {
+        msg.tool_calls = std::move(calls);
+        return true;
+    }
+    return false;
+}
+
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
         throw std::invalid_argument("'input' is required");

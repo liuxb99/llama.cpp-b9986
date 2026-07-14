@@ -1088,6 +1088,9 @@ json oaicompat_chat_params_parse(
         }
         llama_params["parse_tool_calls"] = true;
     }
+    if (body.contains("__responses_tool_map")) {
+        llama_params["parse_tool_calls"] = true;
+    }
 
     // merge the template args provided from command line with the args provided in the user request
     auto chat_template_kwargs_object = json_value(body, "chat_template_kwargs", json::object());

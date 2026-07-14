@@ -46,26 +46,37 @@ static const int32_t MAX_TOOL_CALL_EXTRA = 100;
 // Returns true if the generated text contains a tool call whose arguments are not yet valid JSON
 // This indicates the model is in the middle of generating a tool call
 static bool has_incomplete_tool_call(const std::string & generated_text, const common_chat_parser_params & parser_params) {
-    if (parser_params.format == COMMON_CHAT_FORMAT_CONTENT_ONLY || !parser_params.parse_tool_calls) {
+    if (!parser_params.parse_tool_calls) {
         return false;
     }
     if (generated_text.empty()) {
         return false;
     }
     try {
-        common_chat_msg msg = common_chat_parse(generated_text, true, parser_params);
-        if (msg.tool_calls.empty()) {
-            return false;
-        }
-        // If any tool call has invalid arguments, we're still generating
-        for (const auto & tc : msg.tool_calls) {
-            if (!tool_call_arguments_valid(tc)) {
-                return true;
+        if (parser_params.format != COMMON_CHAT_FORMAT_CONTENT_ONLY) {
+            common_chat_msg msg = common_chat_parse(generated_text, true, parser_params);
+            if (!msg.tool_calls.empty()) {
+                for (const auto & tc : msg.tool_calls) {
+                    if (!tool_call_arguments_valid(tc)) {
+                        return true;
+                    }
+                }
+                return false;
             }
         }
     } catch (const std::exception &) {
-        // If parsing throws, don't block generation
-        return false;
+        // fall through to fallback
+    }
+    // No PEG-parsed tool calls; try <tool_call> fallback (Responses bridge)
+    if (generated_text.find("<tool_call>") != std::string::npos) {
+        common_chat_msg fallback_msg;
+        if (parse_xml_tool_call_fallback(generated_text, true, parser_params.generation_prompt, fallback_msg)) {
+            for (const auto & tc : fallback_msg.tool_calls) {
+                if (!tool_call_arguments_valid(tc)) {
+                    return true;
+                }
+            }
+        }
     }
     return false;
 }

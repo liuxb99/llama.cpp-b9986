@@ -55,6 +55,15 @@ json server_chat_convert_responses_to_chatcmpl(const json & body);
 // Build tool mapping from Responses tools for reverse lookup during output
 json build_responses_tool_map(const json & response_body);
 
+// Parse <tool_call>name{json}</tool_call> format from generated text without invoking
+// the full PEG tool-call grammar (used when tools are not injected into model prompt).
+// Returns true if any tool calls were detected and msg was updated.
+bool parse_xml_tool_call_fallback(
+    const std::string & raw_text,
+    bool is_partial,
+    const std::string & gen_prompt,
+    common_chat_msg & msg);
+
 // Convert Anthropic Messages API format to OpenAI Chat Completions API format
 json server_chat_convert_anthropic_to_oai(const json & body);
 

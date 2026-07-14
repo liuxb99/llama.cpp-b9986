@@ -168,6 +168,14 @@ common_chat_msg task_result_state::update_chat_msg(
         generated_text,
         is_partial,
         chat_parser_params);
+
+    // Try <tool_call> fallback when PEG parser found no tool calls
+    // (Responses bridge: tools kept out of prompt, model still emits <tool_call> tags)
+    if (new_msg.tool_calls.empty() && generated_text.find("<tool_call>") != std::string::npos) {
+        parse_xml_tool_call_fallback(generated_text, is_partial,
+            chat_parser_params.generation_prompt, new_msg);
+    }
+
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;

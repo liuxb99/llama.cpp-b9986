@@ -1911,6 +1911,75 @@ static void test_convert_responses_to_chatcmpl() {
         assert_equals(true, result["__responses_tool_map"].contains("web_search"));
         assert_equals(std::string("web_search"), result["__responses_tool_map"]["web_search"]["original_type"].get<std::string>());
     }
+
+    // Test <tool_call> fallback parser - complete tool call
+    {
+        common_chat_msg msg;
+        msg.content = "placeholder";
+        parse_xml_tool_call_fallback(
+            "Hello <tool_call>get_weather{\"loc\":\"NYC\"}</tool_call> how are you?",
+            false, "", msg);
+        assert_equals(std::string("Hello  how are you?"), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("get_weather"), msg.tool_calls[0].name);
+        assert_equals(std::string(R"({"loc":"NYC"})"), msg.tool_calls[0].arguments);
+    }
+
+    // Test <tool_call> fallback parser - partial during streaming
+    {
+        common_chat_msg msg;
+        msg.content = "thinking...";
+        parse_xml_tool_call_fallback(
+            "thinking... <tool_call>get_weather{\"loc\":\"NYC\"",
+            true, "", msg);
+        assert_equals(std::string("thinking... "), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("get_weather"), msg.tool_calls[0].name);
+        assert_equals(std::string(R"({"loc":"NYC")"), msg.tool_calls[0].arguments);
+    }
+
+    // Test <tool_call> fallback parser - no tool call in text
+    {
+        common_chat_msg msg;
+        msg.content = "plain text";
+        bool found = parse_xml_tool_call_fallback("Hello world", false, "", msg);
+        assert_equals(false, found);
+    }
+
+    // Test <tool_call> fallback parser - generation prompt stripped
+    {
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "<|assistant|><tool_call>fn{}</tool_call>",
+            false, "<|assistant|>", msg);
+        assert_equals(std::string(""), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("fn"), msg.tool_calls[0].name);
+    }
+
+    // Test <tool_call> fallback parser - multiple tool call blocks
+    {
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "<tool_call>fn1{}</tool_call><tool_call>fn2{}</tool_call>",
+            false, "", msg);
+        assert_equals(std::string(""), msg.content);
+        assert_equals((size_t)2, msg.tool_calls.size());
+        assert_equals(std::string("fn1"), msg.tool_calls[0].name);
+        assert_equals(std::string("fn2"), msg.tool_calls[1].name);
+    }
+
+    // Test <tool_call> fallback parser - parallel within one block
+    {
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "<tool_call>fn1{}fn2{}</tool_call>",
+            false, "", msg);
+        assert_equals(std::string(""), msg.content);
+        assert_equals((size_t)2, msg.tool_calls.size());
+        assert_equals(std::string("fn1"), msg.tool_calls[0].name);
+        assert_equals(std::string("fn2"), msg.tool_calls[1].name);
+    }
 }
 
 // Shared LFM2 parser cases - all variants use one output format and parser
