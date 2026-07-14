@@ -8,7 +8,12 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <string>
+
 using json = nlohmann::ordered_json;
+
+// Sanitize a tool/function name for use as a JSON key
+std::string sanitize_tool_name(const std::string & name, const std::string & fallback = "tool");
 
 // Convert OpenAI Responses API format to OpenAI Chat Completions API format
 json server_chat_convert_responses_to_chatcmpl(const json & body);

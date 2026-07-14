@@ -19,7 +19,7 @@ static json responses_make_text_content(const std::string & text) {
     };
 }
 
-static std::string sanitize_tool_name(const std::string & name, const std::string & fallback = "tool") {
+std::string sanitize_tool_name(const std::string & name, const std::string & fallback) {
     std::string out;
     out.reserve(name.size());
     for (unsigned char ch : name) {
