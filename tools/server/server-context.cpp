@@ -45,7 +45,10 @@ static const int32_t MAX_TOOL_CALL_EXTRA = 100;
 
 // Returns true if the generated text contains a tool call whose arguments are not yet valid JSON
 // This indicates the model is in the middle of generating a tool call
-static bool has_incomplete_tool_call(const std::string & generated_text, const common_chat_parser_params & parser_params) {
+static bool has_incomplete_tool_call(
+    const std::string & generated_text,
+    const common_chat_parser_params & parser_params,
+    const std::map<std::string, nlohmann::ordered_json> * tool_map = nullptr) {
     if (!parser_params.parse_tool_calls) {
         return false;
     }
@@ -67,10 +70,12 @@ static bool has_incomplete_tool_call(const std::string & generated_text, const c
     } catch (const std::exception &) {
         // fall through to fallback
     }
-    // No PEG-parsed tool calls; try <tool_call> fallback (Responses bridge)
-    if (generated_text.find("<tool_call>") != std::string::npos) {
+    // No PEG-parsed tool calls; try <tool_call>/<invoke> fallback (Responses bridge)
+    bool has_xml_tag = generated_text.find("<tool_call>") != std::string::npos ||
+                       generated_text.find("<invoke") != std::string::npos;
+    if (has_xml_tag) {
         common_chat_msg fallback_msg;
-        if (parse_xml_tool_call_fallback(generated_text, true, parser_params.generation_prompt, fallback_msg)) {
+        if (parse_xml_tool_call_fallback(generated_text, true, parser_params.generation_prompt, fallback_msg, tool_map)) {
             for (const auto & tc : fallback_msg.tool_calls) {
                 if (!tool_call_arguments_valid(tc)) {
                     return true;
@@ -1978,7 +1983,8 @@ private:
         // If so, override soft stops (except EOS) to allow the tool call to complete
         if (!slot.has_next_token && !slot.truncated && slot.stop != STOP_TYPE_EOS) {
             const auto & parser_params = slot.task->params.chat_parser_params;
-            if (has_incomplete_tool_call(slot.generated_text, parser_params)) {
+            const auto & resp_map = slot.task->params.responses_tool_map;
+            if (has_incomplete_tool_call(slot.generated_text, parser_params, &resp_map)) {
                 if (slot.n_tool_call_extra < MAX_TOOL_CALL_EXTRA) {
                     slot.n_tool_call_extra++;
                     slot.has_next_token = true;

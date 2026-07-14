@@ -169,11 +169,15 @@ common_chat_msg task_result_state::update_chat_msg(
         is_partial,
         chat_parser_params);
 
-    // Try <tool_call> fallback when PEG parser found no tool calls
-    // (Responses bridge: tools kept out of prompt, model still emits <tool_call> tags)
-    if (new_msg.tool_calls.empty() && generated_text.find("<tool_call>") != std::string::npos) {
-        parse_xml_tool_call_fallback(generated_text, is_partial,
-            chat_parser_params.generation_prompt, new_msg);
+    // Try <tool_call> / <invoke> fallback when PEG parser found no tool calls
+    // (Responses bridge: tools kept out of prompt, model still emits XML tool call tags)
+    if (new_msg.tool_calls.empty()) {
+        bool has_xml_tag = generated_text.find("<tool_call>") != std::string::npos ||
+                           generated_text.find("<invoke") != std::string::npos;
+        if (has_xml_tag) {
+            parse_xml_tool_call_fallback(generated_text, is_partial,
+                chat_parser_params.generation_prompt, new_msg, resp_tool_map);
+        }
     }
 
     if (!new_msg.empty()) {

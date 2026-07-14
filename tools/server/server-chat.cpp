@@ -497,20 +497,89 @@ static json find_web_search_replacement(
     return json();
 }
 
+// -------------------------------------------------
+// Helper: parse <invoke name="X"><parameter name="k">v</parameter></invoke>
+// Returns true and fills name + ordered_json params object.
+static bool parse_invoke_block(
+    const std::string & text,
+    size_t block_start,
+    size_t block_end,
+    std::string & out_name,
+    nlohmann::ordered_json & out_params)
+{
+    // Find name="..." attribute in opening tag
+    size_t na = text.find("name=\"", block_start);
+    if (na == std::string::npos || na >= block_end) return false;
+    na += 6;
+    if (na >= text.size()) return false;
+    size_t ne = text.find("\"", na);
+    if (ne == std::string::npos || ne >= block_end) return false;
+    out_name = text.substr(na, ne - na);
+    if (out_name.empty()) return false;
+
+    // Find end of opening <invoke ...>
+    size_t ote = text.find(">", ne);
+    if (ote == std::string::npos || ote >= block_end) return false;
+
+    // Find </invoke>
+    size_t cte = text.rfind("</invoke>", block_end);
+    if (cte == std::string::npos || cte < ote) return false;
+
+    // Parse <parameter name="...">value</parameter> inside
+    nlohmann::ordered_json params = nlohmann::ordered_json::object();
+    size_t pp = ote + 1;
+    while (pp < cte) {
+        size_t ps = text.find("<parameter name=\"", pp);
+        if (ps == std::string::npos || ps >= cte) break;
+        ps += 17;
+        size_t pne = text.find("\"", ps);
+        if (pne == std::string::npos || pne >= cte) break;
+        std::string pn = text.substr(ps, pne - ps);
+
+        size_t tc = text.find(">", pne);
+        if (tc == std::string::npos || tc >= cte) break;
+
+        size_t pc = text.find("</parameter>", tc + 1);
+        if (pc == std::string::npos || pc >= cte) break;
+
+        params[pn] = text.substr(tc + 1, pc - tc - 1);
+        pp = pc + 12;
+    }
+
+    out_params = std::move(params);
+    return true;
+}
+
 bool parse_xml_tool_call_fallback(
     const std::string & raw_text,
     bool is_partial,
     const std::string & gen_prompt,
-    common_chat_msg & msg) {
+    common_chat_msg & msg,
+    const std::map<std::string, nlohmann::ordered_json> * tool_map) {
 
     std::string text = raw_text;
     if (!gen_prompt.empty() && text.substr(0, gen_prompt.size()) == gen_prompt) {
         text = text.substr(gen_prompt.size());
     }
 
-    if (text.find("<tool_call>") == std::string::npos) {
+    if (text.find("<tool_call>") == std::string::npos &&
+        text.find("<invoke") == std::string::npos) {
         return false;
     }
+
+    // Pre-compute tool name lookup from map
+    // Build a set of all known tool names (function/custom/namespace/tool_search/web_search)
+    std::set<std::string> known_names;
+    if (tool_map) {
+        for (const auto & entry : *tool_map) {
+            known_names.insert(entry.first);
+        }
+    }
+
+    // Helper: check if a parsed tool name is valid (in map, or no map = accept all)
+    auto name_accepted = [&](const std::string & name) -> bool {
+        return !tool_map || known_names.count(sanitize_tool_name(name)) > 0;
+    };
 
     std::string clean_content;
     std::vector<common_chat_tool_call> calls;
@@ -518,22 +587,64 @@ bool parse_xml_tool_call_fallback(
     size_t pos = 0;
 
     while (pos < text.size()) {
-        // Find next <tool_call>
+        // Find earliest XML tag
         size_t ts = text.find("<tool_call>", pos);
-        if (ts == std::string::npos) {
+        size_t ti = text.find("<invoke", pos);
+
+        size_t tag_pos;
+        bool is_invoke;
+
+        if (ts == std::string::npos && ti == std::string::npos) {
             clean_content += text.substr(pos);
             break;
+        } else if (ts == std::string::npos) {
+            tag_pos = ti; is_invoke = true;
+        } else if (ti == std::string::npos) {
+            tag_pos = ts; is_invoke = false;
+        } else {
+            tag_pos = std::min(ts, ti);
+            is_invoke = (tag_pos == ti);
         }
 
-        // Text before this <tool_call> stays as content
-        if (ts > pos) {
-            clean_content += text.substr(pos, ts - pos);
+        // Text before this tag stays as content
+        if (tag_pos > pos) {
+            clean_content += text.substr(pos, tag_pos - pos);
         }
 
+        // ======================= <invoke name="X"> handler =======================
+        if (is_invoke) {
+            // Find closing </invoke>
+            size_t ite = text.find("</invoke>", tag_pos);
+            size_t block_end = (ite != std::string::npos) ? ite + 9 : text.size();
+
+            std::string invoke_name;
+            nlohmann::ordered_json invoke_params;
+            bool parsed_ok = parse_invoke_block(text, tag_pos, block_end, invoke_name, invoke_params);
+
+            bool accepted = parsed_ok && name_accepted(invoke_name);
+
+            if (accepted) {
+                // Accepted: emit tool call, strip from content
+                common_chat_tool_call call;
+                call.name = std::move(invoke_name);
+                call.arguments = invoke_params.dump();
+                calls.push_back(std::move(call));
+            } else {
+                // Rejected: keep raw block as content
+                clean_content += text.substr(tag_pos, block_end - tag_pos);
+            }
+
+            pos = block_end;
+            continue;
+        }
+
+        // ======================= <tool_call> handler =======================
         // Determine search boundary: at most up to </tool_call>
-        size_t ci = ts + 11;
+        size_t ci = tag_pos + 11;
         size_t tag_end = text.find("</tool_call>", ci);
         size_t block_end = (tag_end != std::string::npos) ? tag_end : text.size();
+
+        bool any_accepted = false;
 
         // Parse one or more name{json} pairs from ci
         while (ci < block_end) {
@@ -558,10 +669,11 @@ bool parse_xml_tool_call_fallback(
 
                 if (ci >= block_end || text[ci] != '{') {
                     // Name with no JSON — accept in partial mode only
-                    if (is_partial) {
+                    if (is_partial && name_accepted(name)) {
                         common_chat_tool_call call;
                         call.name = std::move(name);
                         calls.push_back(std::move(call));
+                        any_accepted = true;
                         ci = block_end;
                     }
                     break;
@@ -612,13 +724,19 @@ bool parse_xml_tool_call_fallback(
                 if (json_end != std::string::npos) {
                     auto parsed_json = json::parse(call.arguments, nullptr, false);
                     if (!parsed_json.is_discarded()) {
-                        calls.push_back(std::move(call));
+                        if (name_accepted(call.name)) {
+                            calls.push_back(std::move(call));
+                            any_accepted = true;
+                        }
                         continue;   // next name{json} in same block
                     }
                     break;          // invalid JSON
                 } else if (is_partial) {
                     call.arguments = text.substr(json_start, ci - json_start);
-                    calls.push_back(std::move(call));
+                    if (name_accepted(call.name)) {
+                        calls.push_back(std::move(call));
+                        any_accepted = true;
+                    }
                     ci = block_end; // stop scanning further
                     break;
                 } else {
@@ -653,11 +771,13 @@ bool parse_xml_tool_call_fallback(
                     if (!parsed_json.is_discarded() && parsed_json.is_object()) {
                         std::string fn_name = json_value(parsed_json, "name", std::string());
                         if (!fn_name.empty() && parsed_json.contains("arguments")) {
-                            common_chat_tool_call call;
-                            call.name = std::move(fn_name);
-                            call.arguments = parsed_json["arguments"].dump();
-                            calls.push_back(std::move(call));
-                            // Advance past this JSON block
+                            if (name_accepted(fn_name)) {
+                                common_chat_tool_call call;
+                                call.name = std::move(fn_name);
+                                call.arguments = parsed_json["arguments"].dump();
+                                calls.push_back(std::move(call));
+                                any_accepted = true;
+                            }
                             ci = json_end + 1;
                             continue;
                         }
@@ -671,6 +791,10 @@ bool parse_xml_tool_call_fallback(
 
         // Move past this block
         if (tag_end != std::string::npos) {
+            // If no calls were accepted from this block, keep raw text as content
+            if (!any_accepted) {
+                clean_content += text.substr(tag_pos, tag_end + 12 - tag_pos);
+            }
             pos = tag_end + 12;
         } else {
             pos = text.size();

@@ -1980,6 +1980,105 @@ static void test_convert_responses_to_chatcmpl() {
         assert_equals(std::string("fn1"), msg.tool_calls[0].name);
         assert_equals(std::string("fn2"), msg.tool_calls[1].name);
     }
+
+    // Test <invoke> parse with accepted tool_map
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["get_weather"]["original_type"] = "function";
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "The weather is <invoke name=\"get_weather\">\n<parameter name=\"loc\">NYC</parameter>\n</invoke> now",
+            false, "", msg, &tool_map);
+        assert_equals(std::string("The weather is  now"), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("get_weather"), msg.tool_calls[0].name);
+    }
+
+    // Test <invoke> rejected by empty tool_map
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "text <invoke name=\"unknown_tool\"><parameter name=\"x\">1</parameter></invoke> rest",
+            false, "", msg, &tool_map);
+        assert_equals(std::string("text <invoke name=\"unknown_tool\"><parameter name=\"x\">1</parameter></invoke> rest"), msg.content);
+        assert_equals((size_t)0, msg.tool_calls.size());
+    }
+
+    // Test <tool_call> accepted by tool_map
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["get_weather"]["original_type"] = "function";
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "hi <tool_call>get_weather{\"loc\":\"NYC\"}</tool_call> bye",
+            false, "", msg, &tool_map);
+        assert_equals(std::string("hi  bye"), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("get_weather"), msg.tool_calls[0].name);
+    }
+
+    // Test <tool_call> rejected by empty tool_map
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "hi <tool_call>unknown_fn{\"x\":1}</tool_call> bye",
+            false, "", msg, &tool_map);
+        assert_equals(std::string("hi <tool_call>unknown_fn{\"x\":1}</tool_call> bye"), msg.content);
+        assert_equals((size_t)0, msg.tool_calls.size());
+    }
+
+    // Test <tool_call> partial accepted during streaming
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["update_plan"]["original_type"] = "function";
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "<tool_call>update_plan{\"steps\":[\"hello\"",
+            true, "", msg, &tool_map);
+        assert_equals(std::string(""), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("update_plan"), msg.tool_calls[0].name);
+    }
+
+    // Test <invoke> partial during streaming
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["get_forecast"]["original_type"] = "function";
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "<invoke name=\"get_forecast\"><parameter name=\"city\">NYC",
+            true, "", msg, &tool_map);
+        assert_equals(std::string(""), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("get_forecast"), msg.tool_calls[0].name);
+    }
+
+    // Test accept first, reject second in same <tool_call> block
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["accepted"]["original_type"] = "function";
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "<tool_call>accepted{}rejected{}</tool_call>",
+            false, "", msg, &tool_map);
+        // If any call accepted, the block is stripped; only accepted calls emitted
+        assert_equals(std::string(""), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("accepted"), msg.tool_calls[0].name);
+    }
+
+    // Test NULL tool_map (backward compat) still accepts all
+    {
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "<tool_call>fnX{}</tool_call>",
+            false, "", msg, nullptr);
+        assert_equals(std::string(""), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("fnX"), msg.tool_calls[0].name);
+    }
 }
 
 // Shared LFM2 parser cases - all variants use one output format and parser

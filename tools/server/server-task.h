@@ -136,6 +136,9 @@ struct task_result_state {
     bool        oai_resp_reasoning_done = false;
     bool        oai_resp_message_done = false;
 
+    // Optional pointer to the Responses tool map for validating parsed tool calls
+    const std::map<std::string, nlohmann::ordered_json> * resp_tool_map = nullptr;
+
     task_result_state(const common_chat_parser_params & chat_parser_params);
 
     // parse partial tool calls and update the internal state
@@ -260,7 +263,11 @@ struct server_task {
     // the task will be moved into queue, then onto slots
     // however, the state must be kept by caller (e.g., HTTP thread)
     task_result_state create_state() const {
-        return task_result_state(params.chat_parser_params);
+        auto state = task_result_state(params.chat_parser_params);
+        if (!params.responses_tool_map.empty()) {
+            state.resp_tool_map = &params.responses_tool_map;
+        }
+        return state;
     }
 
     bool is_parent() const {

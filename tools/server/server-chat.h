@@ -62,7 +62,8 @@ bool parse_xml_tool_call_fallback(
     const std::string & raw_text,
     bool is_partial,
     const std::string & gen_prompt,
-    common_chat_msg & msg);
+    common_chat_msg & msg,
+    const std::map<std::string, nlohmann::ordered_json> * tool_map = nullptr);
 
 // Convert Anthropic Messages API format to OpenAI Chat Completions API format
 json server_chat_convert_anthropic_to_oai(const json & body);
