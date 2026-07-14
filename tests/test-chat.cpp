@@ -2180,6 +2180,129 @@ static void test_convert_responses_to_chatcmpl() {
         assert_equals(std::string("shell_command"), msg.tool_calls[0].name);
         assert_equals(std::string("tool_search"), msg.tool_calls[1].name);
     }
+
+    // === Tool output format hint tests ===
+
+    // Test 1: Responses with tool_map → hint present in system message
+    {
+        json input = json::parse(R"({
+            "input": "Hello",
+            "instructions": "You are a helpful assistant.",
+            "model": "test-model",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "loc": {"type": "string"}
+                        },
+                        "required": ["loc"]
+                    }
+                }
+            ]
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        // Tools not injected
+        assert_equals(false, result.contains("tools"));
+
+        // Tool map present
+        assert_equals(true, result.contains("__responses_tool_map"));
+
+        // System message exists with hint appended
+        assert_equals(true, result.contains("messages"));
+        auto & msgs = result["messages"];
+        assert_equals(true, msgs.is_array());
+        assert_equals((size_t)2, msgs.size());
+        assert_equals(std::string("system"), msgs[0]["role"].get<std::string>());
+        std::string sys_content = msgs[0]["content"].get<std::string>();
+        assert_equals(true, sys_content.find("<tool_call>tool_name") != std::string::npos);
+        assert_equals(true, sys_content.find("Never place Markdown code fences inside <tool_call>") != std::string::npos);
+    }
+
+    // Test 2: Responses without tool_map → no hint
+    {
+        json input = json::parse(R"({
+            "input": "Hello",
+            "instructions": "Be helpful.",
+            "model": "test-model"
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        assert_equals(false, result.contains("tools"));
+        assert_equals(false, result.contains("__responses_tool_map"));
+        std::string sys_content = result["messages"][0]["content"].get<std::string>();
+        assert_equals(std::string("Be helpful."), sys_content); // unchanged
+    }
+
+    // Test 3: Multi-turn — hint not duplicated when already present
+    {
+        json input = json::parse(R"({
+            "input": "Hello",
+            "instructions": "You are a helpful assistant.\n\nWhen calling a tool, output exactly:\n<tool_call>tool_name{\"key\":\"value\"}</tool_call>\nNever place Markdown code fences inside <tool_call>.",
+            "model": "test-model",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "get_weather",
+                    "description": "Get weather",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "loc": {"type": "string"}
+                        },
+                        "required": ["loc"]
+                    }
+                }
+            ]
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        // Hint should appear exactly once
+        std::string sys_content = result["messages"][0]["content"].get<std::string>();
+        size_t first = sys_content.find("<tool_call>tool_name");
+        size_t last  = sys_content.rfind("<tool_call>tool_name");
+        assert_equals(first, last); // only one occurrence
+    }
+
+    // Test 4: No system prompt but tools present → hint system message created
+    {
+        json input = json::parse(R"({
+            "input": "Hello",
+            "model": "test-model",
+            "tools": [
+                {
+                    "type": "function",
+                    "name": "shell_command",
+                    "description": "Run a shell command",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {"type": "string"}
+                        },
+                        "required": ["command"]
+                    }
+                }
+            ]
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        // A system message with the hint should be prepended
+        assert_equals(true, result.contains("messages"));
+        auto & msgs = result["messages"];
+        assert_equals(true, msgs.is_array());
+        assert_equals(true, msgs.size() >= 1);
+        assert_equals(std::string("system"), msgs[0]["role"].get<std::string>());
+        std::string sys_content = msgs[0]["content"].get<std::string>();
+        assert_equals(true, sys_content.find("<tool_call>tool_name") != std::string::npos);
+    }
 }
 
 // Shared LFM2 parser cases - all variants use one output format and parser

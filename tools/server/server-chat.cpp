@@ -1542,6 +1542,27 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         json tool_map = build_responses_tool_map(response_body);
         if (!tool_map.empty()) {
             chatcmpl_body["__responses_tool_map"] = tool_map;
+
+            // Append minimal tool output format hint to system prompt
+            // (only once per conversation — checked by marker string)
+            static const char * TOOL_CALL_HINT =
+                "\n\nWhen calling a tool, output exactly:\n"
+                "<tool_call>tool_name{\"key\":\"value\"}</tool_call>\n"
+                "Never place Markdown code fences inside <tool_call>.";
+
+            auto & messages = chatcmpl_body["messages"];
+            if (messages.is_array() && !messages.empty() && messages[0].value("role", "") == "system") {
+                std::string content = messages[0].value("content", std::string());
+                if (content.find("<tool_call>tool_name") == std::string::npos) {
+                    messages[0]["content"] = content + TOOL_CALL_HINT;
+                }
+            } else {
+                // No existing system prompt — create one with the hint
+                json sys_msg;
+                sys_msg["role"]    = "system";
+                sys_msg["content"] = std::string(TOOL_CALL_HINT + 2); // skip leading \n\n
+                messages.array().insert(messages.array().begin(), sys_msg);
+            }
         }
     }
 
