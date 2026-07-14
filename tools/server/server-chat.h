@@ -116,3 +116,12 @@ json convert_transcriptions_to_chatcmpl(
     std::vector<raw_buffer> & out_files);
 
 json server_chat_msg_diff_to_json_oaicompat(const common_chat_msg_diff & diff);
+
+// Build a reverse map from the Responses tools[] array for output restoration.
+// Each entry is keyed by sanitized tool name and contains original_type,
+// original_name, and original_tool (the full tool definition).
+json build_responses_tool_map(const json & response_body);
+
+// Convert an OpenAI Responses API request body to Chat Completions API format.
+// Handles all input item types, tool history, instructions, and tool_map building.
+json server_chat_convert_responses_to_chatcmpl(const json & response_body);
