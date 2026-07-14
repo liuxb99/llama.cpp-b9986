@@ -1177,6 +1177,106 @@ static void dump_responses_tools(const json & response_body) {
         fs::absolute(md_path).string().c_str());
 }
 
+// ---------------------------------------------------------------------------
+// Adaptive tool exposure for Responses API
+// ---------------------------------------------------------------------------
+
+// Default thresholds for deciding whether to inject tool schemas directly
+// into the model prompt or defer them.
+static constexpr size_t DIRECT_MAX_TOOLS          = 32;
+static constexpr size_t DIRECT_MAX_SCHEMA_CHARS   = 65536;
+static constexpr size_t DIRECT_MAX_NAMESPACE_SUB  = 32;
+
+enum class ToolExposure {
+    direct,       // Inject tools into chat completion body
+    search_only,  // Erase tools, keep tool_map for output restoration
+    none,         // No tools at all
+};
+
+static std::string tool_exposure_to_str(ToolExposure e) {
+    switch (e) {
+        case ToolExposure::direct:      return "direct";
+        case ToolExposure::search_only: return "search_only";
+        case ToolExposure::none:        return "none";
+    }
+    return "unknown";
+}
+
+struct ToolExposureCounts {
+    size_t function   = 0;
+    size_t custom     = 0;
+    size_t namespace_ = 0;
+    size_t ns_sub     = 0;
+    size_t tool_search = 0;
+    size_t web_search = 0;
+    size_t expanded   = 0;  // total after namespace expansion
+};
+
+// Count tools by type from the Responses tools[] array and compute
+// the expanded total (namespace sub-tools are counted individually).
+static ToolExposureCounts count_responses_tools(const json & body) {
+    ToolExposureCounts counts;
+    if (!body.contains("tools") || !body.at("tools").is_array()) {
+        return counts;
+    }
+    for (const auto & tool : body.at("tools")) {
+        const std::string type = json_value(tool, "type", std::string());
+        if (type == "function") {
+            counts.function++;
+            counts.expanded++;
+        } else if (type == "custom") {
+            counts.custom++;
+            counts.expanded++;
+        } else if (type == "namespace") {
+            counts.namespace_++;
+            size_t n = 0;
+            if (tool.contains("tools") && tool.at("tools").is_array()) {
+                for (const auto & sub : tool.at("tools")) {
+                    if (json_value(sub, "type", std::string()) == "function") {
+                        n++;
+                    }
+                }
+            }
+            counts.ns_sub += n;
+            counts.expanded += n;
+        } else if (type == "tool_search") {
+            counts.tool_search++;
+            counts.expanded++;
+        } else if (type == "web_search") {
+            counts.web_search++;
+            counts.expanded++;
+        } else {
+            counts.expanded++;
+        }
+    }
+    return counts;
+}
+
+// Decide whether to inject tool schemas into the chat completion body.
+//
+// Rules (first match wins):
+//   1. No tools → none
+//   2. expanded_tool_count <= DIRECT_MAX_TOOLS (32)
+//      AND expanded_schema_chars <= DIRECT_MAX_SCHEMA_CHARS (65536)
+//      AND namespace_subtools <= DIRECT_MAX_NAMESPACE_SUB (32)
+//      → direct
+//   3. Otherwise → search_only
+static ToolExposure decide_responses_tool_exposure(
+    const ToolExposureCounts & counts,
+    size_t schema_chars)
+{
+    if (counts.expanded == 0) {
+        return ToolExposure::none;
+    }
+    if (counts.expanded <= DIRECT_MAX_TOOLS &&
+        schema_chars <= DIRECT_MAX_SCHEMA_CHARS &&
+        counts.ns_sub <= DIRECT_MAX_NAMESPACE_SUB)
+    {
+        return ToolExposure::direct;
+    }
+    return ToolExposure::search_only;
+}
+
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
         throw std::invalid_argument("'input' is required");
@@ -1537,16 +1637,65 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
 
     chatcmpl_body["messages"] = chatcmpl_messages;
 
-    // Build tool map only — no tools injected into model prompt
+    // Adaptive tool exposure: decide whether to inject tool schemas
+    // into the model prompt based on tool count and schema size.
+    ToolExposure exposure = ToolExposure::none;
+    size_t tool_schema_chars_before = 0;
+    size_t tool_schema_chars_after  = 0;
+    size_t direct_tool_count        = 0;
+    size_t deferred_tool_count      = 0;
+    std::string exposure_reason;
+
     if (response_body.contains("tools") && response_body.at("tools").is_array() && !response_body.at("tools").empty()) {
+        // Always build the tool map for output restoration
         json tool_map = build_responses_tool_map(response_body);
         if (!tool_map.empty()) {
             chatcmpl_body["__responses_tool_map"] = tool_map;
         }
-    }
 
-    // Ensure tools are never passed to the model prompt
-    chatcmpl_body.erase("tools");
+        // Count tools and estimate schema size
+        ToolExposureCounts counts = count_responses_tools(response_body);
+        tool_schema_chars_before = response_body.at("tools").dump().size();
+        exposure = decide_responses_tool_exposure(counts, tool_schema_chars_before);
+
+        switch (exposure) {
+            case ToolExposure::direct: {
+                // Build Chat Completions format tools from Responses tools
+                const json & resp_tools = response_body.at("tools");
+                std::vector<json> chatcmpl_tools;
+                chatcmpl_tools.reserve(counts.expanded);
+                for (const auto & resp_tool : resp_tools) {
+                    std::vector<json> converted = responses_tool_to_chatcmpl_tools(resp_tool);
+                    for (json & t : converted) {
+                        chatcmpl_tools.push_back(std::move(t));
+                    }
+                }
+                if (!chatcmpl_tools.empty()) {
+                    chatcmpl_body["tools"] = chatcmpl_tools;
+                    direct_tool_count = chatcmpl_tools.size();
+                    tool_schema_chars_after = chatcmpl_body["tools"].dump().size();
+                    exposure_reason = "small_tool_set";
+                }
+                deferred_tool_count = counts.expanded > direct_tool_count
+                    ? counts.expanded - direct_tool_count : 0;
+                break;
+            }
+            case ToolExposure::search_only: {
+                chatcmpl_body.erase("tools");
+                deferred_tool_count = counts.expanded;
+                tool_schema_chars_after = 0;
+                exposure_reason = "large_tool_set";
+                break;
+            }
+            case ToolExposure::none:
+            default: {
+                chatcmpl_body.erase("tools");
+                tool_schema_chars_after = 0;
+                exposure_reason = "no_tools";
+                break;
+            }
+        }
+    }
 
     // Convert tool_choice object to Chat Completions format
     if (chatcmpl_body.contains("tool_choice") && chatcmpl_body.at("tool_choice").is_object()) {
@@ -1614,9 +1763,14 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         size_t body_chars = chatcmpl_body.dump().size();
         int has_tools = chatcmpl_body.contains("tools") ? 1 : 0;
         int has_map  = chatcmpl_body.contains("__responses_tool_map") ? 1 : 0;
+        const std::string exp_str = tool_exposure_to_str(exposure);
         SRV_CNT("[RESP_CTX] stage=request_convert_end"
-                " diag_seq=%u messages=%zu tools=%zu tool_map=%zu original_tool=%zu body_chars=%zu has_tools=%d has_map=%d\n",
-                resp_diag_seq, n_msgs, n_tools, n_map, n_orig_tool, body_chars, has_tools, has_map);
+                " diag_seq=%u messages=%zu tools=%zu tool_map=%zu original_tool=%zu body_chars=%zu has_tools=%d has_map=%d"
+                " exposure=%s direct=%zu deferred=%zu schema_before=%zu schema_after=%zu reason=%s\n",
+                resp_diag_seq, n_msgs, n_tools, n_map, n_orig_tool, body_chars, has_tools, has_map,
+                exp_str.c_str(), direct_tool_count, deferred_tool_count,
+                tool_schema_chars_before, tool_schema_chars_after,
+                exposure_reason.empty() ? "none" : exposure_reason.c_str());
     }
 
     return chatcmpl_body;
