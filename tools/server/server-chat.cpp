@@ -330,7 +330,7 @@ static std::vector<json> responses_tool_to_chatcmpl_tools(const json & resp_tool
 
 // Build a tool mapping from Responses tools array for reverse lookup during output.
 // Key: exposed function name → {original_type, original_name, namespace_name, ...}
-static json build_responses_tool_map(const json & response_body) {
+json build_responses_tool_map(const json & response_body) {
     json map_obj = json::object();
     if (!response_body.contains("tools") || !response_body.at("tools").is_array()) {
         return map_obj;
@@ -850,10 +850,11 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             std::string repl_orig_name = repl_fn_name;
             std::string repl_ns_name;
             auto orig_it = tool_map.find(repl_fn_name);
-            if (orig_it != tool_map.end() && orig_it->value().is_object()) {
-                repl_orig_type = json_value(orig_it->value(), "original_type", std::string("function"));
-                repl_orig_name = json_value(orig_it->value(), "original_name", repl_fn_name);
-                repl_ns_name  = json_value(orig_it->value(), "namespace_name", std::string());
+            if (orig_it != tool_map.end() && orig_it->is_object()) {
+                const json & entry = *orig_it;
+                repl_orig_type = json_value(entry, "original_type", std::string("function"));
+                repl_orig_name = json_value(entry, "original_name", repl_fn_name);
+                repl_ns_name  = json_value(entry, "namespace_name", std::string());
             }
             // Record replacement mapping for round-trip
             json repl_info = json{
