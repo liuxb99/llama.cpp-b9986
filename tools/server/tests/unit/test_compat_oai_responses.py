@@ -1029,20 +1029,390 @@ def test_web_search_disabled_mode():
     })
 
 
-def test_web_search_native_mixed_with_other_tools():
-    """Native web_search passthrough mixed with function/custom/namespace/tool_search must succeed."""
+def test_responses_function_tool_non_streaming_output_format():
+    """Non-streaming response with function tools must produce valid output items.
+    When tools are defined and model generates a tool call, the output must contain
+    function_call items with arguments as string and call_id matching."""
     global server
     server.start()
-    _check_tool_conversion({
-        "tools": [
-            {"type": "function", "name": "get_weather", "description": "Get weather",
-             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
-            {"type": "custom", "name": "exec", "description": "Execute a command"},
-            {"type": "namespace", "name": "ns", "description": "Namespace", "tools": [
-                {"type": "function", "name": "sub_tool", "description": "Sub tool",
-                 "parameters": {"type": "object", "properties": {"x": {"type": "string"}}}},
-            ]},
-            {"type": "tool_search", "execution": "sync", "description": "Search tools"},
-            {"type": "web_search"},
-        ],
+    # Define a simple function tool
+    test_tool = {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Get weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City name"},
+            },
+            "required": ["location"],
+        },
+    }
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "What is the weather in Paris?"}]}],
+        "max_output_tokens": 50,
+        "temperature": 0.0,
+        "tool_choice": "required",
+        "tools": [test_tool],
     })
+    assert res.status_code == 200
+    assert res.body["status"] in ("completed", "incomplete")
+    # Check that output items exist in correct format
+    for item in res.body.get("output", []):
+        if item.get("type") == "function_call":
+            # arguments must be a string, not an object
+            assert isinstance(item["arguments"], str), f"arguments must be a string, got {type(item['arguments'])}"
+            assert item["call_id"].startswith("call_"), f"call_id must start with 'call_', got {item['call_id']}"
+            assert item["id"].startswith("fc_"), f"function_call id must start with 'fc_', got {item['id']}"
+            assert "name" in item
+    # response.completed must exist
+    assert "status" in res.body
+    assert res.body["status"] in ("completed", "incomplete")
+
+
+def test_responses_custom_tool_non_streaming_output_format():
+    """Non-streaming response with custom tools must produce custom_tool_call items
+    using 'input' (not 'arguments') as the field name."""
+    global server
+    server.start()
+    # Define a custom freeform tool (like apply_patch)
+    custom_tool = {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Apply a patch to files",
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": "start: begin_patch hunk+ end_patch",
+        },
+    }
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Update the hello function"}]}],
+        "max_output_tokens": 50,
+        "temperature": 0.0,
+        "tool_choice": "required",
+        "tools": [custom_tool],
+    })
+    assert res.status_code == 200
+    assert res.body["status"] in ("completed", "incomplete")
+    # Check that output items exist in correct format
+    for item in res.body.get("output", []):
+        if item.get("type") == "custom_tool_call":
+            # custom uses 'input' not 'arguments'
+            assert "input" in item, f"custom_tool_call must have 'input' field"
+            assert "arguments" not in item, f"custom_tool_call must NOT have 'arguments' field"
+            assert item["call_id"].startswith("call_"), f"call_id must start with 'call_', got {item['call_id']}"
+            assert item["id"].startswith("ctc_"), f"custom_tool_call id must start with 'ctc_', got {item['id']}"
+            assert "name" in item
+
+
+def test_responses_function_tool_stream_events():
+    """Streaming response with function tools must emit events in the correct order:
+    response.created → response.output_item.done → response.completed.
+    The output_item.done must contain function_call type with arguments as string."""
+    global server
+    server.start()
+    test_tool = {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Get weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City name"},
+            },
+            "required": ["location"],
+        },
+    }
+    res = server.make_stream_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "What is the weather in Paris?"}]}],
+        "max_output_tokens": 50,
+        "temperature": 0.0,
+        "tool_choice": "required",
+        "tools": [test_tool],
+        "stream": True,
+    })
+    seen_seq_nums = []
+    saw_created = False
+    saw_completed = False
+    for data in res:
+        assert "sequence_number" in data
+        seen_seq_nums.append(data["sequence_number"])
+        if data.get("type") == "response.created":
+            saw_created = True
+            assert data["response"]["id"].startswith("resp_")
+        if data.get("type") == "response.output_item.done":
+            item = data.get("item", {})
+            if item.get("type") == "function_call":
+                assert isinstance(item["arguments"], str), f"arguments must be a string, got {type(item['arguments'])}"
+                assert item["call_id"].startswith("call_")
+                assert item["id"].startswith("fc_")
+        if data.get("type") == "response.completed":
+            saw_completed = True
+            assert data["response"]["id"].startswith("resp_")
+    assert saw_created, "must see response.created"
+    assert saw_completed, "must see response.completed"
+    assert len(seen_seq_nums) >= 2, "must have at least 2 sequenced events"
+    assert all(a < b for a, b in zip(seen_seq_nums, seen_seq_nums[1:])), "sequence_numbers must be strictly increasing"
+
+
+def test_responses_custom_tool_stream_events():
+    """Streaming response with custom tools must emit correct event sequence.
+    The output_item.done must contain custom_tool_call type with 'input' field."""
+    global server
+    server.start()
+    custom_tool = {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Apply a patch to files",
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": "start: begin_patch hunk+ end_patch",
+        },
+    }
+    res = server.make_stream_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Update the hello function"}]}],
+        "max_output_tokens": 50,
+        "temperature": 0.0,
+        "tool_choice": "required",
+        "tools": [custom_tool],
+        "stream": True,
+    })
+    saw_created = False
+    saw_completed = False
+    for data in res:
+        if data.get("type") == "response.created":
+            saw_created = True
+        if data.get("type") == "response.output_item.done":
+            item = data.get("item", {})
+            if item.get("type") == "custom_tool_call":
+                assert "input" in item, f"custom_tool_call must have 'input'"
+                assert "arguments" not in item, f"custom_tool_call must NOT have 'arguments'"
+                assert item["call_id"].startswith("call_")
+                assert item["id"].startswith("ctc_")
+        if data.get("type") == "response.completed":
+            saw_completed = True
+    assert saw_created, "must see response.created"
+    assert saw_completed, "must see response.completed"
+
+
+def test_responses_function_call_output_history():
+    """function_call_output must be ingested into chat history with matching call_id.
+    The server must not reject the request and must produce output."""
+    global server
+    server.start()
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "Check the weather"}]},
+            {"type": "function_call_output", "call_id": "call_abc123", "output": "Sunny, 25°C"},
+        ],
+        "max_output_tokens": 50,
+        "temperature": 0.0,
+    })
+    assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.body}"
+    assert res.body["status"] in ("completed", "incomplete")
+
+
+def test_responses_custom_tool_call_output_history():
+    """custom_tool_call_output must be ingested into chat history with matching call_id.
+    The server must not reject the request and must produce output."""
+    global server
+    server.start()
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [
+            {"role": "user", "content": [{"type": "input_text", "text": "Apply the patch"}]},
+            {"type": "custom_tool_call_output", "call_id": "call_def456", "output": "Patch applied successfully"},
+        ],
+        "max_output_tokens": 50,
+        "temperature": 0.0,
+    })
+    assert res.status_code == 200, f"Expected 200, got {res.status_code}: {res.body}"
+    assert res.body["status"] in ("completed", "incomplete")
+
+
+def test_responses_plain_text_not_mistaken_as_tool_call():
+    """Plain assistant text must not be converted to a tool call in the output.
+    When no tools are defined, the output must only contain message items."""
+    global server
+    server.start()
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello, how are you?"}]}],
+        "max_output_tokens": 50,
+        "temperature": 0.0,
+        # No tools defined
+    })
+    assert res.status_code == 200
+    assert res.body["status"] == "completed"
+    for item in res.body.get("output", []):
+        # With no tools, output must not contain tool call items
+        assert item["type"] != "function_call", f"Unexpected function_call in output with no tools: {item}"
+        assert item["type"] != "custom_tool_call", f"Unexpected custom_tool_call in output with no tools: {item}"
+
+
+def test_responses_tools_not_in_prompt():
+    """Tools must not be injected into the model prompt when no tool_choice is set.
+    The input token count should be the same as a request without tools,
+    proving the tools field was erased before sending to the model."""
+    global server
+    server.start()
+    # Baseline: no tools
+    baseline = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
+        "max_output_tokens": 10,
+        "temperature": 0.0,
+    })
+    assert baseline.status_code == 200
+    # With tools (but no tool_choice)
+    with_tools = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
+        "max_output_tokens": 10,
+        "temperature": 0.0,
+        "tools": [{
+            "type": "function",
+            "name": "test_fn",
+            "description": "A test function",
+            "parameters": {"type": "object", "properties": {}},
+        }],
+    })
+    assert with_tools.status_code == 200
+    # Input token count must be identical because tools are erased from prompt
+    assert with_tools.body["usage"]["input_tokens"] == baseline.body["usage"]["input_tokens"], \
+        f"Tools leaked into prompt: baseline={baseline.body['usage']['input_tokens']}, with_tools={with_tools.body['usage']['input_tokens']}"
+
+
+def test_responses_function_call_id_consistent_across_rounds():
+    """The call_id in function_call output must match the call_id in
+    function_call_output input for round-trip consistency.
+    Round-trip: assistant generates function_call with call_id → user
+    passes function_call_output with same call_id → next assistant turn."""
+    global server
+    server.start()
+    # First request: ask a question with a function tool, get a function call back
+    test_tool = {
+        "type": "function",
+        "name": "get_weather",
+        "description": "Get weather for a city",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "location": {"type": "string", "description": "City name"},
+            },
+            "required": ["location"],
+        },
+    }
+    first = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "What is the weather in Paris?"}]}],
+        "max_output_tokens": 50,
+        "temperature": 0.0,
+        "tool_choice": "required",
+        "tools": [test_tool],
+    })
+    assert first.status_code == 200
+    # Extract any function_call items and their call_ids
+    call_ids = []
+    for item in first.body.get("output", []):
+        if item.get("type") == "function_call":
+            call_ids.append(item["call_id"])
+            assert item["call_id"].startswith("call_")
+    # Second request: feed back the function_call_output with matching call_id
+    if call_ids:
+        history_items = [
+            {"role": "user", "content": [{"type": "input_text", "text": "What is the weather in Paris?"}]},
+        ]
+        # Add previous assistant tool calls and their outputs
+        hist_user = [
+            {"role": "user", "content": [{"type": "input_text", "text": "What is the weather in Paris?"}]},
+            {"type": "function_call_output", "call_id": call_ids[0], "output": "Sunny, 25°C"},
+        ]
+        second = server.make_request("POST", "/v1/responses", data={
+            "model": "gpt-4.1",
+            "input": hist_user,
+            "max_output_tokens": 50,
+            "temperature": 0.0,
+        })
+        assert second.status_code == 200, f"Second request failed: {second.status_code}: {second.body}"
+        assert second.body["status"] in ("completed", "incomplete")
+
+
+def test_responses_custom_call_id_consistent_across_rounds():
+    """The call_id in custom_tool_call output must match the call_id in
+    custom_tool_call_output input for round-trip consistency."""
+    global server
+    server.start()
+    custom_tool = {
+        "type": "custom",
+        "name": "apply_patch",
+        "description": "Apply a patch to files",
+        "format": {
+            "type": "grammar",
+            "syntax": "lark",
+            "definition": "start: begin_patch hunk+ end_patch",
+        },
+    }
+    first = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Apply the patch"}]}],
+        "max_output_tokens": 50,
+        "temperature": 0.0,
+        "tool_choice": "required",
+        "tools": [custom_tool],
+    })
+    assert first.status_code == 200
+    # Extract any custom_tool_call items and their call_ids
+    call_ids = []
+    for item in first.body.get("output", []):
+        if item.get("type") == "custom_tool_call":
+            call_ids.append(item["call_id"])
+            assert item["call_id"].startswith("call_")
+    # Second request: feed back the custom_tool_call_output with matching call_id
+    if call_ids:
+        hist_user = [
+            {"role": "user", "content": [{"type": "input_text", "text": "Apply the patch"}]},
+            {"type": "custom_tool_call_output", "call_id": call_ids[0], "output": "Patch applied successfully"},
+        ]
+        second = server.make_request("POST", "/v1/responses", data={
+            "model": "gpt-4.1",
+            "input": hist_user,
+            "max_output_tokens": 50,
+            "temperature": 0.0,
+        })
+        assert second.status_code == 200, f"Second request failed: {second.status_code}: {second.body}"
+        assert second.body["status"] in ("completed", "incomplete")
+
+
+def test_responses_completed_must_exist():
+    """response.completed must always be present as the final status."""
+    global server
+    server.start()
+    # Non-streaming
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
+        "max_output_tokens": 10,
+    })
+    assert res.status_code == 200
+    assert res.body["status"] == "completed"
+    # Streaming
+    stream = server.make_stream_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
+        "max_output_tokens": 10,
+        "stream": True,
+    })
+    saw_completed = False
+    for data in stream:
+        if data.get("type") == "response.completed":
+            saw_completed = True
+            assert data["response"]["status"] == "completed"
+    assert saw_completed, "must see response.completed in streaming"

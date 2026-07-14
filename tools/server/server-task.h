@@ -486,6 +486,9 @@ struct server_task_result_cmpl_partial : server_task_result {
     // for Anthropic API: track if any reasoning content has been generated
     bool anthropic_has_reasoning = false;
 
+    // Optional pointer to the Responses tool map for resolving tool types during streaming
+    const std::map<std::string, nlohmann::ordered_json> * resp_tool_map = nullptr;
+
     virtual bool is_stop() override {
         return false; // in stream mode, partial responses are not considered stop
     }

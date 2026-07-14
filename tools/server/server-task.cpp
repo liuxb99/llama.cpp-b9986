@@ -709,6 +709,30 @@ static json build_responses_sse(const char * event, int & seq_num, const json & 
 }
 
 
+// Determine the original Responses tool type (function/custom/namespace/etc.)
+// from the tool_map by looking up the sanitized tool name.
+// Returns "function" as default when the name is not found in the map.
+static std::string get_resp_tool_type(
+    const std::string & name,
+    const std::map<std::string, nlohmann::ordered_json> & tool_map)
+{
+    if (tool_map.empty()) {
+        return "function";
+    }
+    const std::string sanitized = sanitize_tool_name(name);
+    auto it = tool_map.find(sanitized);
+    if (it != tool_map.end()) {
+        return json_value(it->second, "original_type", std::string("function"));
+    }
+    // Check custom_tool_ prefix (used in build_responses_tool_map for custom tools)
+    const std::string custom_key = "custom_tool_" + sanitized;
+    auto it2 = tool_map.find(custom_key);
+    if (it2 != tool_map.end()) {
+        return json_value(it2->second, "original_type", std::string("function"));
+    }
+    return "function";
+}
+
 // Generic tool-call restorer that reads the preserved original_tool from the
 // mapping entry and produces the correct output item for the Responses API.
 // This enables protocol-preserving passthrough for all tool types including
@@ -976,9 +1000,13 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     bool has_incomplete_tool = false;
     for (size_t i = 0; i < oaicompat_msg.tool_calls.size(); i++) {
         const auto & tool_call = oaicompat_msg.tool_calls[i];
+        // Determine correct item ID prefix based on tool type
+        const std::string tool_type_for_id = get_resp_tool_type(
+            tool_call.name, generation_params.responses_tool_map);
+        const std::string default_prefix = (tool_type_for_id == "custom") ? "ctc_" : "fc_";
         const std::string fc_item_id = (i < oai_resp_fc_item_ids.size())
             ? oai_resp_fc_item_ids[i]
-            : "fc_" + random_string();
+            : default_prefix + random_string();
         const bool valid = tool_call_arguments_valid(tool_call);
         output.push_back(restore_responses_tool_call(
             tool_call, fc_item_id, valid ? "completed" : "incomplete",
@@ -1082,9 +1110,13 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     bool has_incomplete_tool = false;
     for (size_t i = 0; i < oaicompat_msg.tool_calls.size(); i++) {
         const auto & tool_call = oaicompat_msg.tool_calls[i];
+        // Determine correct item ID prefix based on tool type
+        const std::string tool_type_for_id = get_resp_tool_type(
+            tool_call.name, generation_params.responses_tool_map);
+        const std::string default_prefix = (tool_type_for_id == "custom") ? "ctc_" : "fc_";
         const std::string fc_item_id = (i < oai_resp_fc_item_ids.size())
             ? oai_resp_fc_item_ids[i]
-            : "fc_" + random_string();
+            : default_prefix + random_string();
         const bool valid = tool_call_arguments_valid(tool_call);
         const json restored = restore_responses_tool_call(
             tool_call, fc_item_id, valid ? "completed" : "incomplete",
@@ -1452,6 +1484,9 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     oai_resp_reasoning_content    = state.chat_msg.reasoning_content;
     oai_resp_message_content      = state.chat_msg.content;
 
+    // Copy tool map pointer for tool-type resolution during streaming
+    resp_tool_map = state.resp_tool_map;
+
     // track if the accumulated message has any reasoning content
     anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
 
@@ -1480,14 +1515,25 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
         }
         if (!diff.tool_call_delta.name.empty()) {
             state.oai_resp_fc_id = diff.tool_call_delta.id;
-            // Generate stable fc_ item ID for this tool call
-            state.oai_resp_fc_item_id = "fc_" + random_string();
+            // Determine tool type from resp_tool_map to use correct prefix (fc_ vs ctc_)
+            const std::string tool_type = (state.resp_tool_map && !state.resp_tool_map->empty())
+                ? get_resp_tool_type(diff.tool_call_delta.name, *state.resp_tool_map)
+                : std::string("function");
+            const std::string item_id_prefix = (tool_type == "custom") ? "ctc_" : "fc_";
+            state.oai_resp_fc_item_id = item_id_prefix + random_string();
             state.oai_resp_fc_item_ids.push_back(state.oai_resp_fc_item_id);
             state.oai_resp_seq_num++; // output_item.added
             state.oai_resp_output_idx++;
         }
         if (!diff.tool_call_delta.arguments.empty()) {
-            state.oai_resp_seq_num++; // function_call_arguments.delta
+            // Only count function_call_arguments.delta for function calls
+            // Custom tools don't emit function_call_arguments.delta
+            const std::string tool_type = (state.resp_tool_map && !state.resp_tool_map->empty())
+                ? get_resp_tool_type(diff.tool_call_delta.name, *state.resp_tool_map)
+                : std::string("function");
+            if (tool_type != "custom") {
+                state.oai_resp_seq_num++; // function_call_arguments.delta
+            }
         }
     }
 }
@@ -1747,20 +1793,31 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
         }
 
         if (!diff.tool_call_delta.name.empty()) {
+            // Determine the actual Responses tool type from tool_map
+            const std::string tool_type = (resp_tool_map && !resp_tool_map->empty())
+                ? get_resp_tool_type(diff.tool_call_delta.name, *resp_tool_map)
+                : std::string("function");
+            const bool is_custom = (tool_type == "custom");
+            const std::string item_id_prefix = is_custom ? "ctc_" : "fc_";
             const std::string fc_item_id = oai_resp_fc_item_id.empty()
-                ? "fc_" + random_string()
+                ? item_id_prefix + random_string()
                 : oai_resp_fc_item_id;
+            json item = {
+                {"id",        fc_item_id},
+                {"call_id",   "call_" + diff.tool_call_delta.id},
+                {"name",      diff.tool_call_delta.name},
+                {"type",      is_custom ? "custom_tool_call" : "function_call"},
+                {"status",    "in_progress"},
+            };
+            if (is_custom) {
+                item["input"] = "";
+            } else {
+                item["arguments"] = "";
+            }
             json data = {
                 {"type",  "response.output_item.added"},
                 {"output_index", output_idx},
-                {"item", json {
-                    {"id",        fc_item_id},
-                    {"arguments", ""},
-                    {"call_id",   "call_" + diff.tool_call_delta.id},
-                    {"name",      diff.tool_call_delta.name},
-                    {"type",      "function_call"},
-                    {"status",    "in_progress"},
-                }},
+                {"item", item},
             };
             add_seq(data);
             events.push_back({{"event", "response.output_item.added"}, {"data", data}});
@@ -1768,17 +1825,23 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
         }
 
         if (!diff.tool_call_delta.arguments.empty()) {
-            const std::string fc_item_id = oai_resp_fc_item_id.empty()
-                ? "fc_" + oai_resp_fc_id
-                : oai_resp_fc_item_id;
-            json data = {
-                {"type",    "response.function_call_arguments.delta"},
-                {"delta",   diff.tool_call_delta.arguments},
-                {"item_id", fc_item_id},
-                {"output_index", output_idx},
-            };
-            add_seq(data);
-            events.push_back({{"event", "response.function_call_arguments.delta"}, {"data", data}});
+            // Only emit function_call_arguments.delta for function-type tools
+            const std::string tool_type = (resp_tool_map && !resp_tool_map->empty())
+                ? get_resp_tool_type(diff.tool_call_delta.name, *resp_tool_map)
+                : std::string("function");
+            if (tool_type != "custom") {
+                const std::string fc_item_id = oai_resp_fc_item_id.empty()
+                    ? "fc_" + oai_resp_fc_id
+                    : oai_resp_fc_item_id;
+                json data = {
+                    {"type",    "response.function_call_arguments.delta"},
+                    {"delta",   diff.tool_call_delta.arguments},
+                    {"item_id", fc_item_id},
+                    {"output_index", output_idx},
+                };
+                add_seq(data);
+                events.push_back({{"event", "response.function_call_arguments.delta"}, {"data", data}});
+            }
         }
     }
 
