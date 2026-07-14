@@ -39,7 +39,6 @@ echo Incremental build — llama-server + llama-cli
 echo =================================================
 
 cmake --build build --config Release -j --target llama-server --target llama-cli
-
 if errorlevel 1 (
     echo.
     echo ERROR: Build failed.
