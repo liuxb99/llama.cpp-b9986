@@ -210,29 +210,34 @@ def test_responses_non_function_tool_skipped():
     generate output as if no tools were provided."""
     res = server.make_request("POST", "/v1/responses", data={
         "model": "gpt-4.1",
-        "input": [
+        "input": "Hello",
         "tools": [
-            {"type": "web_search"},
             {"type": "code_interpreter"},
+        ],
+    })
     assert res.status_code == 200
     assert res.body["status"] == "completed"
     # With all tools skipped, the model must still produce text output
     assert len(res.body["output"]) > 0
     assert len(res.body["output_text"]) > 0
+
+
 def test_responses_only_non_function_tools_same_as_no_tools():
     """When ALL tools are non-function types, they should all be filtered out
     and the result should be identical to a request with no tools at all.
     Compare token counts to confirm the tools field was truly empty."""
     no_tools = server.make_request("POST", "/v1/responses", data={
         "model": "gpt-4.1",
-        "input": [
+        "input": "Hello",
+    })
     with_skipped_tools = server.make_request("POST", "/v1/responses", data={
         "model": "gpt-4.1",
-        "input": [
+        "input": "Hello",
         "tools": [
-            {"type": "web_search"},
             {"type": "code_interpreter"},
             {"type": "file_search"},
+        ],
+    })
     assert no_tools.status_code == 200
     assert with_skipped_tools.status_code == 200
     # If tools were truly stripped, prompt token count must be identical
@@ -446,7 +451,7 @@ def test_responses_reasoning_content_string():
     assert res.body["status"] == "completed"
 def test_responses_reasoning_content_null():
     """Reasoning items with content:null (Codex format, issue openai/codex#11834)
-    must be accepted � content may be null when encrypted_content is present."""
+    must be accepted 锟�1锟�7 content may be null when encrypted_content is present."""
     res = server.make_request("POST", "/v1/responses", data={
         "model": "gpt-4.1",
         "input": [
@@ -731,8 +736,8 @@ def test_responses_tool_search_tool():
     })
 
 
-def test_responses_web_search_skipped():
-    """Web search tools are skipped but do not block other tools."""
+def test_responses_web_search_native():
+    """Web search tools are exposed as internal function schemas (native passthrough)."""
     global server
     server.start()
     _check_tool_conversion({
@@ -866,13 +871,14 @@ def test_responses_concurrent_tool_map():
     assert res.status_code == 200
 
 
-# ── Web-search bridge tests ──────────────────────────────────────────────
+# 锟斤拷锟斤拷 Web-search bridge tests 锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷锟斤拷
 
 def test_web_search_replacement_no_override_custom_namespace():
-    """Web search mapping must not overwrite custom/namespace/tool_search maps."""
+    """Web search mapping must not overwrite custom/namespace/tool_search maps (replacement mode)."""
     global server
     server.start()
     _check_tool_conversion({
+        "__responses_web_search_mode": "replacement",
         "tools": [
             {"type": "function", "name": "get_weather", "description": "Get weather",
              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
@@ -888,10 +894,11 @@ def test_web_search_replacement_no_override_custom_namespace():
 
 
 def test_web_search_replacement_custom_type_preserved():
-    """Custom tool used as web_search replacement must retain original_type=custom."""
+    """Custom tool used as web_search replacement must retain original_type=custom (replacement mode)."""
     global server
     server.start()
     _check_tool_conversion({
+        "__responses_web_search_mode": "replacement",
         "tools": [
             {"type": "custom", "name": "web_search", "description": "Search the web for information"},
             {"type": "web_search"},
@@ -900,10 +907,11 @@ def test_web_search_replacement_custom_type_preserved():
 
 
 def test_web_search_replacement_namespace_preserved():
-    """Namespace tool used as web_search replacement must retain original_type=namespace with name."""
+    """Namespace tool used as web_search replacement must retain original_type=namespace with name (replacement mode)."""
     global server
     server.start()
     _check_tool_conversion({
+        "__responses_web_search_mode": "replacement",
         "tools": [
             {"type": "namespace", "name": "search", "description": "Web search namespace", "tools": [
                 {"type": "function", "name": "web_search", "description": "Search the web",
@@ -915,10 +923,11 @@ def test_web_search_replacement_namespace_preserved():
 
 
 def test_web_search_param_query_to_q():
-    """query parameter must remap to q when replacement expects q."""
+    """query parameter must remap to q when replacement expects q (replacement mode)."""
     global server
     server.start()
     _check_tool_conversion({
+        "__responses_web_search_mode": "replacement",
         "tools": [
             {"type": "function", "name": "web_search", "description": "Search the web",
              "parameters": {"type": "object", "properties": {"q": {"type": "string"}},
@@ -929,10 +938,11 @@ def test_web_search_param_query_to_q():
 
 
 def test_web_search_param_query_to_search_query():
-    """query parameter must remap to search_query when replacement expects search_query."""
+    """query parameter must remap to search_query when replacement expects search_query (replacement mode)."""
     global server
     server.start()
     _check_tool_conversion({
+        "__responses_web_search_mode": "replacement",
         "tools": [
             {"type": "function", "name": "web_search", "description": "Search the web",
              "parameters": {"type": "object", "properties": {"search_query": {"type": "string"}},
@@ -943,10 +953,11 @@ def test_web_search_param_query_to_search_query():
 
 
 def test_web_search_case_insensitive_description_match():
-    """Description-based web search matching must be case-insensitive."""
+    """Description-based web search matching must be case-insensitive (replacement mode)."""
     global server
     server.start()
     _check_tool_conversion({
+        "__responses_web_search_mode": "replacement",
         "tools": [
             {"type": "function", "name": "lookup", "description": "WEB Search for content on the INTERNET"},
             {"type": "web_search"},
@@ -955,10 +966,11 @@ def test_web_search_case_insensitive_description_match():
 
 
 def test_web_search_not_code_file_repo_search():
-    """Tools described as code/file/repository/grep/local search must NOT match as web search."""
+    """Tools described as code/file/repository/grep/local search must NOT match as web search (replacement mode)."""
     global server
     server.start()
     _check_tool_conversion({
+        "__responses_web_search_mode": "replacement",
         "tools": [
             {"type": "function", "name": "search", "description": "Search code in repository"},
             {"type": "function", "name": "grep", "description": "Search file contents with grep"},
@@ -969,10 +981,11 @@ def test_web_search_not_code_file_repo_search():
 
 
 def test_web_search_no_replacement_skipped_safely():
-    """When no web-search-compatible tool is available, web_search is safely skipped."""
+    """When no web-search-compatible tool is available in replacement mode, web_search is safely skipped."""
     global server
     server.start()
     _check_tool_conversion({
+        "__responses_web_search_mode": "replacement",
         "tools": [
             {"type": "function", "name": "get_weather", "description": "Get weather",
              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
@@ -982,10 +995,11 @@ def test_web_search_no_replacement_skipped_safely():
 
 
 def test_web_search_mixed_with_custom_shell_and_namespace_mcp_roundtrip():
-    """Mixed web_search + custom shell + namespace MCP must round-trip successfully."""
+    """Mixed web_search + custom shell + namespace MCP must round-trip (replacement mode)."""
     global server
     server.start()
     _check_tool_conversion({
+        "__responses_web_search_mode": "replacement",
         "tools": [
             {"type": "function", "name": "search_web", "description": "Search the web for information",
              "parameters": {"type": "object", "properties": {"q": {"type": "string"}},
@@ -996,6 +1010,39 @@ def test_web_search_mixed_with_custom_shell_and_namespace_mcp_roundtrip():
                  "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
             ]},
             {"type": "tool_search", "execution": "sync", "description": "Search available tools"},
+            {"type": "web_search"},
+        ],
+    })
+
+
+def test_web_search_disabled_mode():
+    """Disabled mode must not expose web_search tool to the model."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "__responses_web_search_mode": "disabled",
+        "tools": [
+            {"type": "web_search"},
+            {"type": "function", "name": "get_weather", "description": "Get weather",
+             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
+        ],
+    })
+
+
+def test_web_search_native_mixed_with_other_tools():
+    """Native web_search passthrough mixed with function/custom/namespace/tool_search must succeed."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "function", "name": "get_weather", "description": "Get weather",
+             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
+            {"type": "custom", "name": "exec", "description": "Execute a command"},
+            {"type": "namespace", "name": "ns", "description": "Namespace", "tools": [
+                {"type": "function", "name": "sub_tool", "description": "Sub tool",
+                 "parameters": {"type": "object", "properties": {"x": {"type": "string"}}}},
+            ]},
+            {"type": "tool_search", "execution": "sync", "description": "Search tools"},
             {"type": "web_search"},
         ],
     })

@@ -696,9 +696,116 @@ static json build_responses_sse(const char * event, int & seq_num, const json & 
 }
 
 
+// Generic tool-call restorer that reads the preserved original_tool from the
+// mapping entry and produces the correct output item for the Responses API.
+// This enables protocol-preserving passthrough for all tool types including
+// web_search, tool_search, custom, namespace, and function.
+static json restore_tool_call_from_original(
+    const common_chat_tool_call & tool_call,
+    const std::string & item_id,
+    const std::string & status,
+    const nlohmann::ordered_json & mapping)
+{
+    const std::string orig_type = json_value(mapping, "original_type", std::string());
+
+    if (orig_type == "web_search") {
+        // Native web_search passthrough: restore as web_search_call with action
+        json args_parsed = json::object();
+        try {
+            json parsed = json::parse(tool_call.arguments);
+            if (parsed.is_object()) {
+                args_parsed = parsed;
+            }
+        } catch (...) {}
+        json action = {
+            {"type", "search"},
+        };
+        for (auto & entry : args_parsed.items()) {
+            action[entry.key()] = entry.value();
+        }
+        return json {
+            {"id",      item_id},
+            {"type",    "web_search_call"},
+            {"status",  status},
+            {"call_id", "call_" + tool_call.id},
+            {"action",  action},
+        };
+    }
+
+    if (orig_type == "function") {
+        return json {
+            {"id",        item_id},
+            {"type",      "function_call"},
+            {"status",    status},
+            {"arguments", tool_call.arguments},
+            {"call_id",   "call_" + tool_call.id},
+            {"name",      json_value(mapping, "original_name", tool_call.name)},
+        };
+    }
+
+    if (orig_type == "custom") {
+        std::string raw_input = tool_call.arguments;
+        try {
+            json args = json::parse(tool_call.arguments);
+            if (args.is_object() && args.contains("input") && args["input"].is_string()) {
+                raw_input = args["input"].get<std::string>();
+            }
+        } catch (...) {}
+        return json {
+            {"id",      item_id},
+            {"type",    "custom_tool_call"},
+            {"status",  status},
+            {"input",   raw_input},
+            {"call_id", "call_" + tool_call.id},
+            {"name",    json_value(mapping, "original_name", tool_call.name)},
+        };
+    }
+
+    if (orig_type == "namespace") {
+        return json {
+            {"id",        item_id},
+            {"type",      "function_call"},
+            {"status",    status},
+            {"arguments", tool_call.arguments},
+            {"call_id",   "call_" + tool_call.id},
+            {"name",      json_value(mapping, "original_name", tool_call.name)},
+            {"namespace", json_value(mapping, "namespace_name", std::string())},
+        };
+    }
+
+    if (orig_type == "tool_search") {
+        json args_parsed = json::object();
+        try {
+            json parsed = json::parse(tool_call.arguments);
+            if (parsed.is_object()) {
+                args_parsed = parsed;
+            }
+        } catch (...) {}
+        return json {
+            {"id",        item_id},
+            {"type",      "tool_search_call"},
+            {"status",    status},
+            {"call_id",   "call_" + tool_call.id},
+            {"execution", json_value(mapping, "execution", std::string("sync"))},
+            {"arguments", args_parsed},
+        };
+    }
+
+    // Unknown type: fall back to function_call
+    return json {
+        {"id",        item_id},
+        {"type",      "function_call"},
+        {"status",    status},
+        {"arguments", tool_call.arguments},
+        {"call_id",   "call_" + tool_call.id},
+        {"name",      sanitize_tool_name(tool_call.name)},
+    };
+}
+
 // Restore original tool call type from mapping for Responses API round-trip.
-// Custom tools: extract raw input from {"input": "..."} wrapper -> custom_tool_call
-// Namespace/function/tool_search: keep as function_call with mapped name
+// When the mapping entry contains "original_tool", delegates to the generic
+// restore_tool_call_from_original helper for protocol-preserving passthrough.
+// Falls back to legacy type-based logic when original_tool is absent.
 static json restore_responses_tool_call(
     const common_chat_tool_call & tool_call,
     const std::string & fc_item_id,
@@ -709,9 +816,13 @@ static json restore_responses_tool_call(
     const std::string default_name = sanitize_tool_name(tool_call.name);
     auto it = tool_map.find(default_name);
     if (it != tool_map.end()) {
+        // New path: if original_tool is present, use generic helper
+        if (it->second.contains("original_tool")) {
+            return restore_tool_call_from_original(tool_call, fc_item_id, status, it->second);
+        }
+        // Legacy path: no original_tool, use existing type-based logic
         const std::string orig_type = json_value(it->second, "original_type", std::string());
         if (orig_type == "custom") {
-            // Extract raw input from {"input": "..."} wrapper
             std::string raw_input = tool_call.arguments;
             try {
                 json args = json::parse(tool_call.arguments);
@@ -754,32 +865,25 @@ static json restore_responses_tool_call(
                 {"name",          json_value(it->second, "original_name", tool_call.name)},
                 {"namespace",     json_value(it->second, "namespace_name", std::string())},
             };
-            } else if (orig_type == "web_search") {
-            // web_search was bridged to a replacement tool; restore to
-            // the replacement tool's original type/name for client execution
+        } else if (orig_type == "web_search") {
+            // Legacy web_search mapping (replacement bridge, no original_tool)
             const std::string repl_exposed = json_value(it->second, "replacement_exposed_name", std::string());
             const std::string repl_type = json_value(it->second, "replacement_original_type", std::string("function"));
             const std::string repl_name = json_value(it->second, "replacement_original_name", std::string());
 
-            // Parameter remapping: model was exposed "query" but replacement may use "q" or "search_query"
-            // Only forward fields that the replacement schema accepts
             std::string args_out = tool_call.arguments;
             try {
                 json args = json::parse(tool_call.arguments);
                 if (args.is_object()) {
-                    // Get the replacement parameter schema
                     json repl_params = json_value(it->second, "replacement_parameters", json::object());
                     json repl_props = json_value(repl_params, "properties", json::object());
                     if (!repl_props.empty()) {
-                        // Build remapped args: only include keys accepted by replacement schema
                         json remapped = json::object();
                         for (auto & prop : args.items()) {
                             const std::string & key = prop.key();
                             if (repl_props.contains(key)) {
-                                // Key is directly accepted
                                 remapped[key] = prop.value();
                             } else if (key == "query") {
-                                // Try to remap query → first param that looks like a query field
                                 if (repl_props.contains("q")) {
                                     remapped["q"] = prop.value();
                                 } else if (repl_props.contains("search_query")) {
@@ -799,7 +903,6 @@ static json restore_responses_tool_call(
                 try {
                     json args = json::parse(args_out);
                     if (args.is_object()) {
-                        // For custom tools, extract the first string value as raw input
                         for (auto & prop : args.items()) {
                             if (prop.value().is_string()) {
                                 raw_input = prop.value().get<std::string>();
@@ -813,14 +916,12 @@ static json restore_responses_tool_call(
                     {"input", raw_input}, {"call_id", "call_" + tool_call.id}, {"name", repl_name},
                 };
             }
-            // Default: function_call with remapped arguments
             return json {
                 {"id", fc_item_id}, {"type", "function_call"}, {"status", status},
                 {"arguments", args_out}, {"call_id", "call_" + tool_call.id},
                 {"name", repl_name.empty() ? "web_search" : repl_name},
             };
         }
-        // function: keep function_call
     }
     // Default: function_call with sanitized name
     return json {

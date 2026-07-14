@@ -318,8 +318,24 @@ static std::vector<json> responses_tool_to_chatcmpl_tools(const json & resp_tool
         result.push_back(chatcmpl_tool);
 
     } else if (type == "web_search") {
-        SRV_WRN("unsupported Responses tool type 'web_search' skipped\n");
-        // web_search has no local backend - skip with warning
+        // Convert web_search to internal function schema for model consumption
+        json ws_params = {
+            {"type", "object"},
+            {"properties", json{
+                {"query", json{{"type", "string"}, {"description", "Web search query to find information on the internet"}}},
+            }},
+            {"required", json::array({"query"})},
+            {"additionalProperties", false},
+        };
+        json chatcmpl_tool;
+        chatcmpl_tool["type"] = "function";
+        chatcmpl_tool["function"] = json {
+            {"name", "web_search"},
+            {"description", "Search the web for real-time information"},
+            {"parameters", ws_params},
+            {"strict", false},
+        };
+        result.push_back(chatcmpl_tool);
 
     } else {
         SRV_WRN("unsupported Responses tool type '%s' skipped\n", type.c_str());
@@ -329,7 +345,8 @@ static std::vector<json> responses_tool_to_chatcmpl_tools(const json & resp_tool
 }
 
 // Build a tool mapping from Responses tools array for reverse lookup during output.
-// Key: exposed function name → {original_type, original_name, namespace_name, ...}
+// Each entry preserves the complete original tool definition for passthrough restoration.
+// Key: exposed function name → {original_type, original_name, namespace_name, original_tool, ...}
 json build_responses_tool_map(const json & response_body) {
     json map_obj = json::object();
     if (!response_body.contains("tools") || !response_body.at("tools").is_array()) {
@@ -341,7 +358,11 @@ json build_responses_tool_map(const json & response_body) {
             const std::string name = sanitize_tool_name(
                 json_value(tool, "name", std::string()));
             if (!name.empty()) {
-                map_obj[name] = json{{"original_type", "function"}, {"original_name", name}};
+                map_obj[name] = {
+                    {"original_type", "function"},
+                    {"original_name", json_value(tool, "name", std::string())},
+                    {"original_tool", tool},
+                };
             }
         } else if (type == "namespace") {
             const std::string ns_name = sanitize_tool_name(
@@ -354,10 +375,11 @@ json build_responses_tool_map(const json & response_body) {
                     std::string sub_name = json_value(sub, "name", std::string());
                     if (sub_name.empty()) { continue; }
                     const std::string qualified = ns_name + "__" + sanitize_tool_name(sub_name);
-                    map_obj[qualified] = json{
+                    map_obj[qualified] = {
                         {"original_type", "namespace"},
                         {"original_name", sub_name},
                         {"namespace_name", json_value(tool, "name", std::string())},
+                        {"original_tool", sub},
                     };
                 }
             }
@@ -365,18 +387,21 @@ json build_responses_tool_map(const json & response_body) {
             const std::string name = sanitize_tool_name(
                 json_value(tool, "name", std::string()), "custom_tool");
             if (!name.empty()) {
-                json info = json{
+                map_obj[name] = {
                     {"original_type", "custom"},
                     {"original_name", json_value(tool, "name", std::string())},
+                    {"original_tool", tool},
                 };
-                map_obj[name] = info;
             }
         } else if (type == "web_search") {
-            // web_search tools need a replacement; stored when found
-            // (replacement is determined during tool conversion)
+            map_obj["web_search"] = {
+                {"original_type", "web_search"},
+                {"original_tool", tool},
+            };
         } else if (type == "tool_search") {
-            map_obj["tool_search"] = json{
+            map_obj["tool_search"] = {
                 {"original_type", "tool_search"},
+                {"original_tool", tool},
                 {"description", json_value(tool, "description", std::string())},
                 {"execution", json_value(tool, "execution", std::string("sync"))},
             };
@@ -791,11 +816,27 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         // Build the full tool map from original response tools (includes function/custom/namespace/tool_search)
         json tool_map = build_responses_tool_map(response_body);
 
-        // Check for explicitly configured web-search replacement tool name (from body field)
+        // Check for web_search mode and explicit replacement tool configuration
+        const std::string ws_mode = json_value(response_body, "__responses_web_search_mode", std::string("native"));
         const std::string configured_ws_tool = json_value(response_body, "__responses_web_search_tool", std::string());
 
-        // Try to replace web_search tools with client search tools
+        // Handle web_search tools
         for (const json & ws : web_search_tools) {
+            if (ws_mode == "disabled") {
+                continue;
+            }
+
+            if (ws_mode == "native" || ws_mode == "auto") {
+                // Native passthrough: expose as simple function for model.
+                // Mapping already has complete original_tool from build_responses_tool_map().
+                std::vector<json> converted = responses_tool_to_chatcmpl_tools(ws);
+                for (json & t : converted) {
+                    chatcmpl_tools.push_back(std::move(t));
+                }
+                continue;
+            }
+
+            // replacement mode: find client search tool to use as bridge
             json replacement = find_web_search_replacement(chatcmpl_tools, configured_ws_tool);
             if (replacement.is_null()) {
                 SRV_WRN("%s", "no compatible client web-search tool available; web_search skipped\n");
