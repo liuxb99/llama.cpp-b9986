@@ -1542,47 +1542,6 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         json tool_map = build_responses_tool_map(response_body);
         if (!tool_map.empty()) {
             chatcmpl_body["__responses_tool_map"] = tool_map;
-
-            // Append minimal tool output format hint to system prompt
-            // (only once per conversation — checked by marker string)
-            // Does NOT modify existing system message content (which may be array).
-            // Instead, appends a new system message with just the hint.
-            static const char * TOOL_CALL_HINT_TEXT =
-                "When calling a tool, output exactly:\n"
-                "<tool_call>tool_name{\"key\":\"value\"}</tool_call>\n"
-                "Never place Markdown code fences inside <tool_call>.";
-
-            auto & messages = chatcmpl_body["messages"];
-            bool hint_exists = false;
-            if (messages.is_array()) {
-                for (const auto & msg : messages) {
-                    if (msg.value("role", "") != "system") continue;
-                    const auto & content = msg["content"];
-                    if (content.is_string()) {
-                        if (content.get_ref<const std::string &>().find("<tool_call>tool_name") != std::string::npos) {
-                            hint_exists = true;
-                            break;
-                        }
-                    } else if (content.is_array()) {
-                        for (const auto & part : content) {
-                            if (part.is_object() && part.value("type", "") == "text") {
-                                if (part.value("text", std::string()).find("<tool_call>tool_name") != std::string::npos) {
-                                    hint_exists = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (hint_exists) break;
-                    }
-                }
-            }
-
-            if (!hint_exists) {
-                json hint_msg;
-                hint_msg["role"]    = "system";
-                hint_msg["content"] = std::string(TOOL_CALL_HINT_TEXT);
-                messages.push_back(hint_msg);
-            }
         }
     }
 
