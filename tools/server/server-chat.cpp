@@ -855,136 +855,16 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
 
     chatcmpl_body["messages"] = chatcmpl_messages;
 
-    // Convert tools
-    json response_tools = json::array();
-    if (response_body.contains("tools")) {
-        chatcmpl_body.erase("tools");
-        if (!response_body.at("tools").is_array()) {
-            SRV_WRN("%s", "'tools' must be an array of objects; ignoring malformed tools field\n");
-        } else {
-            response_tools = response_body.at("tools");
-        }
-    }
-    if (!response_tools.empty()) {
-        std::vector<json> chatcmpl_tools;
-        std::vector<json> web_search_tools;
-        for (const json & resp_tool : response_tools) {
-            const std::string type = json_value(resp_tool, "type", std::string());
-            if (type == "web_search") {
-                web_search_tools.push_back(resp_tool);
-                continue; // handle web_search after other tools are converted
-            }
-            std::vector<json> converted = responses_tool_to_chatcmpl_tools(resp_tool);
-            for (json & t : converted) {
-                chatcmpl_tools.push_back(std::move(t));
-            }
-        }
-        // Build the full tool map from original response tools (includes function/custom/namespace/tool_search)
+    // Build tool map only — no tools injected into model prompt
+    if (response_body.contains("tools") && response_body.at("tools").is_array() && !response_body.at("tools").empty()) {
         json tool_map = build_responses_tool_map(response_body);
-
-        // Check for web_search mode and explicit replacement tool configuration
-        const std::string ws_mode = json_value(response_body, "__responses_web_search_mode", std::string("native"));
-        const std::string configured_ws_tool = json_value(response_body, "__responses_web_search_tool", std::string());
-
-        // Handle web_search tools
-        for (const json & ws : web_search_tools) {
-            if (ws_mode == "disabled") {
-                continue;
-            }
-
-            if (ws_mode == "native" || ws_mode == "auto") {
-                // Native passthrough: expose as simple function for model.
-                // Mapping already has complete original_tool from build_responses_tool_map().
-                std::vector<json> converted = responses_tool_to_chatcmpl_tools(ws);
-                for (json & t : converted) {
-                    chatcmpl_tools.push_back(std::move(t));
-                }
-                continue;
-            }
-
-            // replacement mode: find client search tool to use as bridge
-            json replacement = find_web_search_replacement(chatcmpl_tools, configured_ws_tool);
-            if (replacement.is_null()) {
-                SRV_WRN("%s", "no compatible client web-search tool available; web_search skipped\n");
-                continue;
-            }
-            // Add the replacement function tool with web_search-like parameter schema
-            json ws_fn = replacement.at("function");
-            json ws_params = json_value(ws_fn, "parameters", json::object());
-            if (!ws_params.contains("properties") || !ws_params.at("properties").is_object()) {
-                ws_params = {
-                    {"type", "object"},
-                    {"properties", json{
-                        {"query", json{{"type", "string"}, {"description", "Web search query"}}},
-                    }},
-                    {"required", json::array({"query"})},
-                    {"additionalProperties", false},
-                };
-            }
-            // Ensure there's a query/search field
-            auto & props = ws_params["properties"];
-            bool has_query = false;
-            for (auto & prop : props.items()) {
-                const std::string & k = prop.key();
-                if (k == "query" || k == "q" || k == "search_query") {
-                    has_query = true;
-                    break;
-                }
-            }
-            if (!has_query) {
-                props["query"] = json{{"type", "string"}, {"description", "Web search query"}};
-                if (ws_params.contains("required") && ws_params["required"].is_array()) {
-                    ws_params["required"].push_back("query");
-                }
-            }
-            // Create a web_search-exposed function tool
-            const std::string ws_exposed_name = "web_search";
-            json ws_exposed = json{
-                {"type", "function"},
-                {"function", json{
-                    {"name", ws_exposed_name},
-                    {"description", json_value(ws_fn, "description", std::string())},
-                    {"parameters", ws_params},
-                    {"strict", false},
-                }},
-            };
-            chatcmpl_tools.push_back(ws_exposed);
-
-            // Look up the replacement's original type from the tool map
-            // (instead of guessing from replacement["type"] which is always "function")
-            const std::string repl_fn_name = json_value(ws_fn, "name", std::string());
-            std::string repl_orig_type = "function";
-            std::string repl_orig_name = repl_fn_name;
-            std::string repl_ns_name;
-            auto orig_it = tool_map.find(repl_fn_name);
-            if (orig_it != tool_map.end() && orig_it->is_object()) {
-                const json & entry = *orig_it;
-                repl_orig_type = json_value(entry, "original_type", std::string("function"));
-                repl_orig_name = json_value(entry, "original_name", repl_fn_name);
-                repl_ns_name  = json_value(entry, "namespace_name", std::string());
-            }
-            // Record replacement mapping for round-trip
-            json repl_info = json{
-                {"original_type", "web_search"},
-                {"replacement_exposed_name", ws_exposed_name},
-                {"replacement_original_type", repl_orig_type},
-                {"replacement_original_name", repl_orig_name},
-            };
-            if (!repl_ns_name.empty()) {
-                repl_info["namespace_name"] = repl_ns_name;
-            }
-            // Store replacement schema for parameter remapping on return
-            repl_info["replacement_parameters"] = ws_params;
-            tool_map[ws_exposed_name] = repl_info;
-        }
-        // Store complete tool map (includes all function/custom/namespace/tool_search + web_search)
         if (!tool_map.empty()) {
             chatcmpl_body["__responses_tool_map"] = tool_map;
         }
-        if (!chatcmpl_tools.empty()) {
-            chatcmpl_body["tools"] = chatcmpl_tools;
-        }
     }
+
+    // Ensure tools are never passed to the model prompt
+    chatcmpl_body.erase("tools");
 
     // Convert tool_choice object to Chat Completions format
     if (chatcmpl_body.contains("tool_choice") && chatcmpl_body.at("tool_choice").is_object()) {
@@ -1017,6 +897,11 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             }
             chatcmpl_body["tool_choice"] = "required";
         }
+    }
+
+    // When no tools are injected into prompt, tool_choice is irrelevant
+    if (!chatcmpl_body.contains("tools")) {
+        chatcmpl_body.erase("tool_choice");
     }
 
     if (response_body.contains("max_output_tokens")) {

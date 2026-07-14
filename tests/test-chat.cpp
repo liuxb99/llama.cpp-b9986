@@ -1861,17 +1861,24 @@ static void test_convert_responses_to_chatcmpl() {
 
         json result = server_chat_convert_responses_to_chatcmpl(input);
 
-        assert_equals(true, result.contains("tools"));
-        assert_equals(true, result.at("tools").is_array());
-        assert_equals((size_t)1, result.at("tools").size());
+        // Tools are NOT injected into chat completion body
+        assert_equals(false, result.contains("tools"));
 
-        const auto & tool = result.at("tools")[0];
-        assert_equals(std::string("function"), tool.at("type").get<std::string>());
-        assert_equals(std::string("get_weather"), tool.at("function").at("name").get<std::string>());
-        assert_equals(true, tool.at("function").at("strict").get<bool>());
+        // Tool map preserves all original tools for round-trip
+        assert_equals(true, result.contains("__responses_tool_map"));
+        assert_equals(true, result["__responses_tool_map"].is_object());
+        assert_equals(true, result["__responses_tool_map"].contains("get_weather"));
+        assert_equals(true, result["__responses_tool_map"].contains("web_search"));
+
+        const auto & fn_entry = result["__responses_tool_map"]["get_weather"];
+        assert_equals(std::string("function"), fn_entry["original_type"].get<std::string>());
+        assert_equals(std::string("get_weather"), fn_entry["original_name"].get<std::string>());
+        assert_equals(true, fn_entry.contains("original_tool"));
+        assert_equals(std::string("function"), fn_entry["original_tool"]["type"].get<std::string>());
+        assert_equals(std::string("get_weather"), fn_entry["original_tool"]["name"].get<std::string>());
     }
 
-    // Test non-function Responses tools are ignored
+    // Test non-function Responses tools: mapping preserved but no tools injected
     {
         json input = json::parse(R"({
             "input": "Hello",
@@ -1896,7 +1903,13 @@ static void test_convert_responses_to_chatcmpl() {
 
         json result = server_chat_convert_responses_to_chatcmpl(input);
 
+        // No tools injected into prompt
         assert_equals(false, result.contains("tools"));
+
+        // Tool map still has web_search entry (image_generation/mcp are unhandled types, namespace has no sub-tools)
+        assert_equals(true, result.contains("__responses_tool_map"));
+        assert_equals(true, result["__responses_tool_map"].contains("web_search"));
+        assert_equals(std::string("web_search"), result["__responses_tool_map"]["web_search"]["original_type"].get<std::string>());
     }
 }
 
