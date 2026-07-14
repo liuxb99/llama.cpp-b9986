@@ -49,6 +49,12 @@ static inline uint32_t resp_ctx_next_seq() {
 // Sanitize a tool/function name for use as a JSON key
 std::string sanitize_tool_name(const std::string & name, const std::string & fallback = "tool");
 
+// Convert OpenAI Responses API format to OpenAI Chat Completions API format
+json server_chat_convert_responses_to_chatcmpl(const json & body);
+
+// Build tool mapping from Responses tools for reverse lookup during output
+json build_responses_tool_map(const json & response_body);
+
 // ---------------------------------------------------------------------------
 // Unified tool normalizer for Responses bridge
 // Converts model output in any known XML/JSON format into normalized tool calls
