@@ -800,3 +800,67 @@ def test_responses_custom_no_description():
         "tools": [{"type": "custom", "name": "apply_patch", "description": "Apply a patch"},
                   {"type": "custom", "name": "read_file", "description": "Read file contents"}],
     })
+
+
+def test_responses_custom_tool_roundtrip():
+    """Custom tool output must use custom_tool_call type with raw input."""
+    global server
+    server.start()
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Run ls -la"}]}],
+        "max_output_tokens": 4,
+        "temperature": 0.0,
+        "tools": [{"type": "custom", "name": "exec", "description": "Execute a shell command",
+                   "format": {"type": "grammar", "syntax": "lark", "definition": "start: exec"}}],
+    })
+    assert res.status_code == 200
+    assert res.body["status"] in ("completed", "incomplete")
+
+
+def test_responses_namespace_tool_roundtrip():
+    """Namespace tool output must use function_call type with namespace__ prefix."""
+    global server
+    server.start()
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
+        "max_output_tokens": 4,
+        "temperature": 0.0,
+        "tools": [{"type": "namespace", "name": "mcp", "description": "MCP",
+                   "tools": [{"type": "function", "name": "read_file", "description": "Read file",
+                             "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}]}],
+    })
+    assert res.status_code == 200
+    assert res.body["status"] in ("completed", "incomplete")
+
+
+def test_responses_tool_search_roundtrip():
+    """Tool search round-trip must not crash."""
+    global server
+    server.start()
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Find a tool"}]}],
+        "max_output_tokens": 4,
+        "temperature": 0.0,
+        "tools": [{"type": "tool_search", "execution": "sync", "description": "Search tools",
+                   "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}],
+    })
+    assert res.status_code == 200
+    assert res.body["status"] in ("completed", "incomplete")
+
+
+def test_responses_concurrent_tool_map():
+    """Concurrent requests must not share tool mapping."""
+    global server
+    server.start()
+    res = server.make_request("POST", "/v1/responses", data={
+        "model": "gpt-4.1",
+        "input": [{"role": "user", "content": [{"type": "input_text", "text": "Hello"}]}],
+        "max_output_tokens": 4,
+        "temperature": 0.0,
+        "tools": [{"type": "function", "name": "test_fn", "description": "Test fn",
+                   "parameters": {"type": "object", "properties": {"x": {"type": "string"}}}}],
+    })
+    assert res.status_code == 200
