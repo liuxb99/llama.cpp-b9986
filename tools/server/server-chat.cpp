@@ -370,6 +370,9 @@ static json build_responses_tool_map(const json & response_body) {
                 };
                 map_obj[name] = info;
             }
+        } else if (type == "web_search") {
+            // web_search tools need a replacement; stored when found
+            // (replacement is determined during tool conversion)
         } else if (type == "tool_search") {
             map_obj["tool_search"] = json{
                 {"original_type", "tool_search"},
@@ -379,6 +382,51 @@ static json build_responses_tool_map(const json & response_body) {
         }
     }
     return map_obj;
+}
+
+// Try to find a client search tool to use as web_search replacement.
+// Returns the matching tool entry from chatcmpl_tools (or null if none found).
+static json find_web_search_replacement(const std::vector<json> & chatcmpl_tools) {
+    // Candidate search tool names (ordered by preference)
+    static const char * search_names[] = {
+        "web_search", "search_web", "websearch", "browser_search",
+        "search", "fetch_url", "browser", nullptr,
+    };
+    for (const auto & tool : chatcmpl_tools) {
+        if (!tool.is_object() || !tool.contains("function") || !tool.at("function").is_object()) {
+            continue;
+        }
+        const auto & fn = tool.at("function");
+        const std::string name = json_value(fn, "name", std::string());
+        const std::string desc = json_value(fn, "description", std::string());
+        if (name.empty()) { continue; }
+
+        // Check if name matches a search pattern
+        bool is_search = false;
+        for (const char ** p = search_names; *p; p++) {
+            if (name == *p) { is_search = true; break; }
+        }
+        // Also check description for web search indicators
+        if (!is_search) {
+            const std::string desc_lower = desc;
+            if (desc_lower.find("web") != std::string::npos &&
+                desc_lower.find("search") != std::string::npos) {
+                is_search = true;
+            }
+        }
+        // Filter out non-web search tools
+        if (is_search) {
+            if (desc.find("tool_search") != std::string::npos ||
+                desc.find("grep") != std::string::npos ||
+                desc.find("file") != std::string::npos ||
+                desc.find("code") != std::string::npos ||
+                desc.find("repository") != std::string::npos) {
+                continue; // not web search
+            }
+            return tool;
+        }
+    }
+    return json();
 }
 
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
@@ -686,11 +734,81 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     }
     if (!response_tools.empty()) {
         std::vector<json> chatcmpl_tools;
+        std::vector<json> web_search_tools;
         for (const json & resp_tool : response_tools) {
+            const std::string type = json_value(resp_tool, "type", std::string());
+            if (type == "web_search") {
+                web_search_tools.push_back(resp_tool);
+                continue; // handle web_search after other tools are converted
+            }
             std::vector<json> converted = responses_tool_to_chatcmpl_tools(resp_tool);
             for (json & t : converted) {
                 chatcmpl_tools.push_back(std::move(t));
             }
+        }
+        // Try to replace web_search tools with client search tools
+        json ws_tool_map_obj = json::object();
+        for (const json & ws : web_search_tools) {
+            json replacement = find_web_search_replacement(chatcmpl_tools);
+            if (replacement.is_null()) {
+                SRV_WRN("no compatible client web-search tool available; web_search skipped
+");
+                continue;
+            }
+            // Add the replacement function tool with web_search-like parameter schema
+            json ws_fn = replacement.at("function");
+            json ws_params = json_value(ws_fn, "parameters", json::object());
+            if (!ws_params.contains("properties") || !ws_params.at("properties").is_object()) {
+                ws_params = {
+                    {"type", "object"},
+                    {"properties", json{
+                        {"query", json{{"type", "string"}, {"description", "Web search query"}}},
+                    }},
+                    {"required", json::array({"query"})},
+                    {"additionalProperties", false},
+                };
+            }
+            // Ensure there's a query/search field
+            auto & props = ws_params["properties"];
+            bool has_query = false;
+            for (auto & prop : props.items()) {
+                const std::string & k = prop.key();
+                if (k == "query" || k == "q" || k == "search_query") {
+                    has_query = true;
+                    break;
+                }
+            }
+            if (!has_query) {
+                props["query"] = json{{"type", "string"}, {"description", "Web search query"}};
+                if (ws_params.contains("required") && ws_params["required"].is_array()) {
+                    ws_params["required"].push_back("query");
+                }
+            }
+            // Create a web_search-exposed function tool
+            json ws_exposed = json{
+                {"type", "function"},
+                {"function", json{
+                    {"name", "web_search"},
+                    {"description", json_value(ws_fn, "description", std::string())},
+                    {"parameters", ws_params},
+                    {"strict", false},
+                }},
+            };
+            chatcmpl_tools.push_back(ws_exposed);
+
+            // Record replacement mapping for round-trip
+            const std::string repl_name = json_value(ws_fn, "name", std::string());
+            json repl_info = json{
+                {"original_type", "web_search"},
+                {"replacement_exposed_name", "web_search"},
+                {"replacement_original_type", json_value(replacement, "type", std::string("function"))},
+                {"replacement_original_name", repl_name},
+            };
+            ws_tool_map_obj["web_search"] = repl_info;
+        }
+        // Store web_search replacement mapping in body for tool map extraction
+        if (!ws_tool_map_obj.empty()) {
+            chatcmpl_body["__responses_tool_map"] = ws_tool_map_obj;
         }
         if (!chatcmpl_tools.empty()) {
             chatcmpl_body["tools"] = chatcmpl_tools;

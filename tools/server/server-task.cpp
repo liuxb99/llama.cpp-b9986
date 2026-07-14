@@ -753,6 +753,31 @@ static json restore_responses_tool_call(
                 {"name",          json_value(it->second, "original_name", tool_call.name)},
                 {"namespace",     json_value(it->second, "namespace_name", std::string())},
             };
+            } else if (orig_type == "web_search") {
+            // web_search was bridged to a replacement tool; restore to
+            // the replacement tool's original type/name for client execution
+            const std::string repl_exposed = json_value(it->second, "replacement_exposed_name", std::string());
+            const std::string repl_type = json_value(it->second, "replacement_original_type", std::string("function"));
+            const std::string repl_name = json_value(it->second, "replacement_original_name", std::string());
+            if (repl_type == "custom") {
+                std::string raw_input = tool_call.arguments;
+                try {
+                    json args = json::parse(tool_call.arguments);
+                    if (args.is_object() && args.contains("query") && args["query"].is_string()) {
+                        raw_input = args["query"].get<std::string>();
+                    }
+                } catch (...) {}
+                return json {
+                    {"id", fc_item_id}, {"type", "custom_tool_call"}, {"status", status},
+                    {"input", raw_input}, {"call_id", "call_" + tool_call.id}, {"name", repl_name},
+                };
+            }
+            // Default: function_call
+            return json {
+                {"id", fc_item_id}, {"type", "function_call"}, {"status", status},
+                {"arguments", tool_call.arguments}, {"call_id", "call_" + tool_call.id},
+                {"name", repl_name.empty() ? "web_search" : repl_name},
+            };
         }
         // function: keep function_call
     }
