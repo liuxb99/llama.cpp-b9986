@@ -3,6 +3,12 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
+#include <cstdio>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <mutex>
 #include <set>
 #include <sstream>
 
@@ -809,6 +815,259 @@ bool parse_xml_tool_call_fallback(
     return false;
 }
 
+static void dump_responses_tools(const json & response_body) {
+    const char * env = std::getenv("LLAMA_RESPONSES_DUMP_TOOLS");
+    if (!env || std::string(env) != "1") {
+        return;
+    }
+    if (!response_body.contains("tools") || !response_body["tools"].is_array() || response_body["tools"].empty()) {
+        return;
+    }
+
+    const json & tools = response_body["tools"];
+    json tool_map = build_responses_tool_map(response_body);
+
+    std::string tools_str = tools.dump();
+    uint32_t hash = resp_ctx_hash(tools_str);
+
+    static std::mutex s_mtx;
+    static std::set<uint32_t> s_seen;
+    {
+        std::lock_guard<std::mutex> lock(s_mtx);
+        if (s_seen.count(hash)) { return; }
+        s_seen.insert(hash);
+    }
+
+    char hash_hex[9];
+    std::snprintf(hash_hex, sizeof(hash_hex), "%08x", hash);
+
+    namespace fs = std::filesystem;
+    fs::path dump_dir = fs::absolute("docs");
+    fs::create_directories(dump_dir / "codex-tools");
+
+    // Time stamp
+    std::time_t now = std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+    char time_buf[64];
+    std::strftime(time_buf, sizeof(time_buf), "%Y-%m-%dT%H:%M:%S", std::localtime(&now));
+    std::string captured_at(time_buf);
+
+    // Count expanded (namespace sub-tools expanded)
+    size_t expanded = 0, n_fn = 0, n_cust = 0, n_ns = 0, n_ns_sub = 0, n_ts = 0, n_ws = 0;
+    for (const auto & t : tools) {
+        std::string tt = json_value(t, "type", std::string());
+        if (tt == "function")      { n_fn++; expanded++; }
+        else if (tt == "custom")   { n_cust++; expanded++; }
+        else if (tt == "namespace") { n_ns++; size_t sub = (t.contains("tools") && t["tools"].is_array()) ? t["tools"].size() : 0; n_ns_sub += sub; expanded += sub; }
+        else if (tt == "tool_search") { n_ts++; expanded++; }
+        else if (tt == "web_search")  { n_ws++; expanded++; }
+        else                        { expanded++; }
+    }
+
+    // Write JSON
+    json json_out = {
+        {"captured_at",         captured_at},
+        {"hash",                hash_hex},
+        {"top_level_tool_count", tools.size()},
+        {"expanded_tool_count", expanded},
+        {"tools",               tools},
+        {"tool_map",            tool_map},
+    };
+
+    // Always write latest to main files
+    fs::path json_path = dump_dir / "CODEX_ACTUAL_TOOLS.json";
+    {
+        std::ofstream ofs(json_path);
+        ofs << json_out.dump(2) << "\n";
+    }
+
+    // Per-hash files (one-time)
+    fs::path json_hash_path = dump_dir / "codex-tools" / (std::string(hash_hex) + ".json");
+    {
+        std::ofstream ofs(json_hash_path);
+        ofs << json_out.dump(2) << "\n";
+    }
+
+    // Detect name conflicts
+    std::map<std::string, std::vector<std::string>> sanitized_conflicts;
+    std::map<std::string, std::vector<std::string>> original_name_conflicts;
+    std::set<std::string> seen_sanitized;
+    for (const auto & t : tools) {
+        std::string tt = json_value(t, "type", std::string());
+        if (tt == "namespace") {
+            std::string ns_name = json_value(t, "name", std::string("namespace"));
+            if (t.contains("tools") && t["tools"].is_array()) {
+                for (const auto & sub : t["tools"]) {
+                    std::string sub_name = json_value(sub, "name", std::string());
+                    std::string sanitized = sanitize_tool_name(ns_name + "__" + sanitize_tool_name(sub_name));
+                    sanitized_conflicts[sanitized].push_back(ns_name + "." + sub_name);
+                    original_name_conflicts[sub_name].push_back(sanitized);
+                    seen_sanitized.insert(sanitized);
+                }
+            }
+        } else {
+            std::string name = json_value(t, "name", std::string());
+            std::string sanitized = sanitize_tool_name(tt == "custom" ? "custom_tool_" + name : name);
+            sanitized_conflicts[sanitized].push_back(tt + "/" + name);
+            original_name_conflicts[name].push_back(sanitized);
+            seen_sanitized.insert(sanitized);
+        }
+    }
+
+    // Detect duplicate sanitized names
+    std::vector<std::pair<std::string, std::vector<std::string>>> conflicts;
+    for (const auto & entry : sanitized_conflicts) {
+        if (entry.second.size() > 1) {
+            conflicts.push_back(entry);
+        }
+    }
+
+    // Detect duplicate original names
+    std::vector<std::pair<std::string, std::vector<std::string>>> dup_names;
+    for (const auto & entry : original_name_conflicts) {
+        if (entry.second.size() > 1) {
+            dup_names.push_back(entry);
+        }
+    }
+
+    // Build MD
+    std::ostringstream md;
+    md << "# Codex Tools Dump\n\n";
+    md << "## Overview\n";
+    md << "- **Hash**: `" << hash_hex << "`\n";
+    md << "- **Captured At**: " << captured_at << "\n";
+    md << "- **Top-level Tools**: " << tools.size() << "\n";
+    md << "- **Expanded (with sub-tools)**: " << expanded << "\n\n";
+
+    md << "## Tool Counts by Type\n";
+    md << "| Type | Count |\n|------|-------|\n";
+    md << "| function | " << n_fn << " |\n";
+    md << "| custom | " << n_cust << " |\n";
+    md << "| namespace | " << n_ns << " |\n";
+    md << "| namespace_subtools | " << n_ns_sub << " |\n";
+    md << "| tool_search | " << n_ts << " |\n";
+    md << "| web_search | " << n_ws << " |\n";
+    size_t n_other = tools.size() - n_fn - n_cust - n_ns - n_ts - n_ws;
+    md << "| other | " << n_other << " |\n\n";
+
+    md << "## Tool Details\n\n";
+    int idx = 0;
+    for (const auto & t : tools) {
+        idx++;
+        std::string tt = json_value(t, "type", std::string());
+        std::string name = json_value(t, "name", std::string());
+        std::string sanitized;
+        if (tt == "custom") {
+            sanitized = sanitize_tool_name("custom_tool_" + name);
+        } else {
+            sanitized = sanitize_tool_name(name);
+        }
+        std::string desc = json_value(t, "description", std::string());
+
+        md << "### " << idx << ". " << name << " (" << tt << ")\n";
+        md << "- **Sanitized Name**: `" << sanitized << "`\n";
+
+        // Map entry info
+        std::string map_key = sanitized;
+        std::string map_orig_type = tt;
+        std::string map_orig_name = name;
+        std::string map_ns_name;
+        if (tt == "namespace") {
+            map_key = sanitize_tool_name(name, "namespace");
+            map_orig_type = "namespace";
+            md << "- **Namespace**: `" << name << "`\n";
+            if (t.contains("tools") && t["tools"].is_array()) {
+                md << "- **Sub-tools**: " << t["tools"].size() << "\n\n";
+                for (const auto & sub : t["tools"]) {
+                    std::string sub_name = json_value(sub, "name", std::string());
+                    if (json_value(sub, "type", std::string()) != "function") { continue; }
+                    std::string qualified = map_key + "__" + sanitize_tool_name(sub_name);
+                    auto it = tool_map.find(qualified);
+                    md << "  - Sub-tool: **" << sub_name << "**\n";
+                    md << "    - **Map Key**: `" << qualified << "`\n";
+                    md << "    - **Original Name**: `" << sub_name << "`\n";
+                    if (!json_value(sub, "description", std::string()).empty()) {
+                        md << "    - **Description**: " << json_value(sub, "description", std::string()) << "\n";
+                    }
+                    if (sub.contains("parameters")) {
+                        md << "    - **Parameters**: " << sub["parameters"].dump() << "\n";
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (tt == "custom") {
+            auto it = tool_map.find(map_key);
+            if (it != tool_map.end()) {
+                md << "- **Map Key**: `" << map_key << "`\n";
+                md << "- **Original Type**: `" << json_value(it->second, "original_type", std::string()) << "`\n";
+                md << "- **Original Name**: `" << json_value(it->second, "original_name", std::string()) << "`\n";
+            }
+        } else {
+            auto it = tool_map.find(map_key);
+            if (it != tool_map.end()) {
+                md << "- **Map Key**: `" << map_key << "`\n";
+                md << "- **Original Type**: `" << json_value(it->second, "original_type", std::string()) << "`\n";
+                md << "- **Original Name**: `" << json_value(it->second, "original_name", std::string()) << "`\n";
+            }
+        }
+
+        if (!desc.empty()) {
+            md << "- **Description**: " << desc << "\n";
+        }
+        if (t.contains("parameters")) {
+            md << "- **Parameters**: " << t["parameters"].dump() << "\n";
+        }
+
+        md << "\n";
+    }
+
+    // Conflicts section
+    md << "## Name Conflicts\n\n";
+    if (conflicts.empty()) {
+        md << "None found.\n\n";
+    } else {
+        for (const auto & entry : conflicts) {
+            md << "- **`" << entry.first << "`** maps to multiple tools:\n";
+            for (const auto & src : entry.second) {
+                md << "  - " << src << "\n";
+            }
+        }
+        md << "\n";
+    }
+
+    md << "## Duplicate Original Names\n\n";
+    if (dup_names.empty()) {
+        md << "None found.\n\n";
+    } else {
+        for (const auto & entry : dup_names) {
+            md << "- **`" << entry.first << "`** appears in multiple entries:\n";
+            for (const auto & sanitized : entry.second) {
+                md << "  - `" << sanitized << "`\n";
+            }
+        }
+        md << "\n";
+    }
+
+    // Write MD files
+    fs::path md_path = dump_dir / "CODEX_ACTUAL_TOOLS.md";
+    {
+        std::ofstream ofs(md_path);
+        ofs << md.str();
+    }
+
+    fs::path md_hash_path = dump_dir / "codex-tools" / (std::string(hash_hex) + ".md");
+    {
+        std::ofstream ofs(md_hash_path);
+        ofs << md.str();
+    }
+
+    SRV_CNT("[RESP_TOOLS_DUMP] hash=%s top_level=%zu expanded=%zu json=%s md=%s\n",
+        hash_hex, tools.size(), expanded,
+        fs::absolute(json_path).string().c_str(),
+        fs::absolute(md_path).string().c_str());
+}
+
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
         throw std::invalid_argument("'input' is required");
@@ -853,6 +1112,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 n_fn, n_cust, n_ns, n_ns_sub, n_ts, n_ws, n_unk,
                 ws_mode.c_str(), body_chars);
     }
+
+    dump_responses_tools(response_body);
 
     if (response_body.contains("instructions")) {
         chatcmpl_messages.push_back({
