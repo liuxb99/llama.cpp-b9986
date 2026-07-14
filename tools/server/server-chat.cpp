@@ -1109,7 +1109,7 @@ static bool scan_known_tool_xml_block(
 
 // Parse known-tool XML tags from text, driven by the request-local tool_map.
 // Priority: inserted after existing parsers but before plain text.
-static void parse_known_tool_xml_calls(
+void parse_known_tool_xml_calls(
     const std::string & text,
     bool is_partial,
     const std::map<std::string, nlohmann::ordered_json> & tool_map,
