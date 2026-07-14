@@ -105,6 +105,17 @@ bool parse_xml_tool_call_fallback(
     common_chat_msg & msg,
     const std::map<std::string, nlohmann::ordered_json> * tool_map = nullptr);
 
+// Parse known-tool XML calls from model output, driven by the request-local
+// tool_map. Detects bare <tool_name><param>value</param></tool_name> blocks
+// where the root tag matches a tool_map entry. Acts as the lowest-priority
+// parser before falling back to plain assistant text.
+void parse_known_tool_xml_calls(
+    const std::string & text,
+    bool is_partial,
+    const std::map<std::string, nlohmann::ordered_json> & tool_map,
+    std::vector<NormalizedToolCall> & out_calls,
+    std::string & clean_content);
+
 // Convert Anthropic Messages API format to OpenAI Chat Completions API format
 json server_chat_convert_anthropic_to_oai(const json & body);
 

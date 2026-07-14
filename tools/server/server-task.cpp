@@ -190,6 +190,17 @@ common_chat_msg task_result_state::update_chat_msg(
                 chat_parser_params.generation_prompt, new_msg, resp_tool_map);
             SRV_INF("== XML_FALLBACK: tool_calls=%zu\n", new_msg.tool_calls.size());
         }
+
+        // Known-tool XML fallback: try bare <tool_name><param>value</param></tool_name>
+        if (new_msg.tool_calls.empty() && resp_tool_map && !resp_tool_map->empty()) {
+            std::vector<NormalizedToolCall> known_calls;
+            std::string known_clean;
+            parse_known_tool_xml_calls(generated_text, is_partial, *resp_tool_map, known_calls, known_clean);
+            if (!known_calls.empty()) {
+                SRV_INF("== KNOWN_TOOL_XML: tool_calls=%zu\n", known_calls.size());
+                normalized_calls_to_chat_msg(new_msg, known_calls);
+            }
+        }
     }
 
     if (!new_msg.empty()) {

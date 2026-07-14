@@ -891,6 +891,284 @@ void parse_normalized_tool_calls(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Known-tool XML parser: parse bare <tool_name><param>value</param></tool_name>
+// blocks driven by the request-local responses_tool_map.
+// Only tags whose (maybe resolved) name matches a tool_map entry are accepted.
+// ---------------------------------------------------------------------------
+
+// Scan a single XML-like block starting at the given position.
+// Returns true and populates name + args_json if the root tag is a known tool.
+static bool scan_known_tool_xml_block(
+    const std::string & text,
+    size_t & pos,                  // in/out: start/end of block
+    const std::map<std::string, nlohmann::ordered_json> & tool_map,
+    std::string & out_name,        // resolved map key
+    std::string & out_args_json,   // JSON string of arguments
+    std::string & out_namespace,   // namespace (if any)
+    std::string & out_source,      // "known_tool_xml"
+    bool is_partial,
+    bool & out_partial)
+{
+    out_name.clear();
+    out_args_json.clear();
+    out_namespace.clear();
+    out_source = "known_tool_xml";
+    out_partial = false;
+
+    // Diagnostics for RESP_TOOL_PARSE
+    std::string _diag_root, _diag_resolved, _diag_orig_type, _diag_ns;
+    int _diag_argc = 0;
+    bool _diag_ambiguous = false;
+    std::string _diag_reject;
+    auto _emit_diag = [&]() {
+        if (!resp_ctx_debug_enabled()) return;
+        SRV_INF("[RESP_TOOL_PARSE] source=known_tool_xml"
+                " root=%s resolved=%s type=%s ns=%s args=%d ambig=%d reject=%s\n",
+                _diag_root.c_str(), _diag_resolved.c_str(),_diag_orig_type.c_str(),
+                _diag_ns.c_str(), _diag_argc, (int)_diag_ambiguous, _diag_reject.c_str());
+    };
+
+    if (pos >= text.size() || text[pos] != '<') {
+        return false;
+    }
+
+    // Extract root tag name: <name ...> or <name>
+    size_t tag_start = pos + 1; // skip '<'
+    if (tag_start >= text.size() || text[tag_start] == '/' || text[tag_start] == '?' || text[tag_start] == '!') {
+        return false; // closing tag, processing instruction, DOCTYPE, comment
+    }
+    size_t name_end = tag_start;
+    while (name_end < text.size() && text[name_end] != '>' && text[name_end] != '/' && text[name_end] != ' ' && text[name_end] != '\t' && text[name_end] != '\n') {
+        name_end++;
+    }
+    if (name_end == tag_start) {
+        return false;
+    }
+    std::string root_tag = text.substr(tag_start, name_end - tag_start);
+    _diag_root = root_tag;
+
+    // Find closing tag: </root_tag>
+    std::string close_tag = "</" + root_tag + ">";
+    size_t close_pos = text.find(close_tag, pos);
+    if (close_pos == std::string::npos) {
+        if (!is_partial) return false;
+        out_partial = true;
+        close_pos = text.size();
+    }
+    size_t block_end = close_pos + close_tag.size();
+
+    // Resolve root_tag against tool_map
+    bool custom_is_proxy = false;
+    std::string map_key;
+
+    // Try direct match
+    auto it = tool_map.find(root_tag);
+    if (it != tool_map.end()) {
+        map_key = root_tag;
+    } else {
+        // Try sanitized
+        std::string sanitized = sanitize_tool_name(root_tag);
+        auto it2 = tool_map.find(sanitized);
+        if (it2 != tool_map.end()) {
+            map_key = sanitized;
+        } else {
+            // Try custom_tool_ prefix
+            std::string custom_key = "custom_tool_" + sanitized;
+            auto it3 = tool_map.find(custom_key);
+            if (it3 != tool_map.end()) {
+                map_key = custom_key;
+                custom_is_proxy = true;
+            } else {
+                // Try resolve_tool_name as final lookup
+                std::string resolved = resolve_tool_name(root_tag, "", tool_map);
+                if (!resolved.empty()) {
+                    map_key = resolved;
+                } else {
+                    return false; // unknown tag → not a tool call
+                }
+            }
+        }
+    }
+
+    _diag_resolved = map_key;
+    out_name = map_key;
+
+    const auto & entry = tool_map.at(map_key);
+    const std::string orig_type = json_value(entry, "original_type", std::string("function"));
+    _diag_orig_type = orig_type;
+    if (orig_type == "namespace") {
+        out_namespace = json_value(entry, "namespace_name", std::string());
+        _diag_ns = out_namespace;
+    }
+
+    // Parse child elements as parameters
+    // Inner content starts after <root_tag> and ends before </root_tag>
+    size_t inner_beg = pos;
+    while (inner_beg < text.size() && text[inner_beg] != '>') inner_beg++;
+    if (inner_beg >= text.size()) return false;
+    inner_beg++; // past '>'
+
+    size_t inner_end = close_pos;
+    if (inner_end <= inner_beg) {
+        // Empty element: <tool_name/>
+        out_args_json = "{}";
+        pos = block_end;
+        return true;
+    }
+
+    // Build JSON arguments from <param>value</param> elements
+    nlohmann::ordered_json args = nlohmann::ordered_json::object();
+    size_t ci = inner_beg;
+    bool has_unknown_param = false;
+    bool has_duplicate = false;
+    bool type_error = false;
+
+    while (ci < inner_end) {
+        // Skip whitespace
+        while (ci < inner_end && (text[ci] == ' ' || text[ci] == '\t' || text[ci] == '\n' || text[ci] == '\r')) {
+            ci++;
+        }
+        if (ci >= inner_end) break;
+        if (text[ci] != '<') {
+            // Non-XML text between tags — skip (treat as whitespace/annotation)
+            ci++;
+            continue;
+        }
+        ci++; // skip '<'
+        if (ci >= inner_end) break;
+
+        // Detect closing tag marker
+        if (text[ci] == '/') {
+            // </root_tag> — we've reached the end
+            break;
+        }
+
+        // Extract parameter name
+        size_t pname_start = ci;
+        while (ci < inner_end && text[ci] != '>' && text[ci] != '/' && text[ci] != ' ' && text[ci] != '\t' && text[ci] != '\n') {
+            ci++;
+        }
+        if (ci == pname_start || ci >= inner_end || text[ci] != '>') {
+            break; // malformed
+        }
+        std::string param_name = text.substr(pname_start, ci - pname_start);
+        ci++; // past '>'
+
+        // Find closing </param_name>
+        std::string p_close = "</" + param_name + ">";
+        size_t p_close_pos = text.find(p_close, ci);
+        if (p_close_pos == std::string::npos) {
+            if (!is_partial) break;
+            out_partial = true;
+            p_close_pos = inner_end;
+        }
+
+        // Extract value
+        std::string raw_value = text.substr(ci, p_close_pos - ci);
+        // Trim
+        size_t vs = raw_value.find_first_not_of(" \t\n\r");
+        size_t ve = raw_value.find_last_not_of(" \t\n\r");
+        if (vs != std::string::npos && ve != std::string::npos) {
+            raw_value = raw_value.substr(vs, ve - vs + 1);
+        } else {
+            raw_value.clear();
+        }
+
+        // Check for duplicate
+        if (args.contains(param_name)) {
+            has_duplicate = true;
+            ci = p_close_pos + p_close.size();
+            continue;
+        }
+
+        // Store as string (type coercion happens at the end)
+        args[param_name] = raw_value;
+
+        ci = p_close_pos + p_close.size();
+    }
+
+    if (has_unknown_param || has_duplicate || type_error) {
+        if (has_unknown_param) _diag_reject = "unknown_param";
+        else if (has_duplicate) _diag_reject = "duplicate_param";
+        else _diag_reject = "type_error";
+        _emit_diag();
+        return false;
+    }
+
+    if (out_partial && args.empty()) {
+        return false;
+    }
+
+    out_args_json = args.dump();
+    _diag_argc = (int)args.size();
+    _emit_diag();
+    pos = block_end;
+    return true;
+}
+
+// Parse known-tool XML tags from text, driven by the request-local tool_map.
+// Priority: inserted after existing parsers but before plain text.
+static void parse_known_tool_xml_calls(
+    const std::string & text,
+    bool is_partial,
+    const std::map<std::string, nlohmann::ordered_json> & tool_map,
+    std::vector<NormalizedToolCall> & out_calls,
+    std::string & clean_content)
+{
+    out_calls.clear();
+    clean_content.clear();
+    if (tool_map.empty()) {
+        clean_content = text;
+        return;
+    }
+
+    size_t pos = 0;
+    while (pos < text.size()) {
+        // Look for '<' that could start a known tool tag
+        size_t lt = text.find('<', pos);
+        if (lt == std::string::npos) {
+            clean_content += text.substr(pos);
+            break;
+        }
+
+        // Copy text before the tag
+        if (lt > pos) {
+            clean_content += text.substr(pos, lt - pos);
+        }
+
+        // Try to parse as known-tool XML
+        std::string ntc_name, ntc_args, ntc_ns;
+        std::string ntc_source;
+        bool ntc_partial = false;
+        size_t save_pos = lt;
+
+        if (scan_known_tool_xml_block(text, lt, tool_map, ntc_name, ntc_args, ntc_ns, ntc_source, is_partial, ntc_partial)) {
+            NormalizedToolCall ntc;
+            ntc.name = ntc_name;
+            ntc.arguments = ntc_args;
+            ntc.namespace_name = ntc_ns;
+            ntc.source_format = ntc_source;
+            ntc.partial = ntc_partial;
+            out_calls.push_back(std::move(ntc));
+            pos = lt;
+            lt = pos; // advance past block
+        } else {
+            // Not a known tool XML — advance past '<'
+            pos = lt + 1;
+            // If this looks like a full XML tag (has '>'), skip it
+            size_t gt = text.find('>', pos);
+            if (gt != std::string::npos && gt - pos < 256) {
+                // Could be any XML tag; keep as text
+                clean_content += text.substr(lt, gt - lt + 1);
+                pos = gt + 1;
+            } else {
+                clean_content += '<';
+            }
+        }
+    }
+}
+
 void normalized_calls_to_chat_msg(
     common_chat_msg & msg,
     const std::vector<NormalizedToolCall> & calls)
