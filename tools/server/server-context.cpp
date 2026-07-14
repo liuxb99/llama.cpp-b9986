@@ -4165,6 +4165,14 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
 
+            // Inject Responses tool mapping for round-trip
+            json tool_map_json = json_value(data, "__responses_tool_map", json::object());
+            if (!tool_map_json.empty()) {
+                for (auto it = tool_map_json.begin(); it != tool_map_json.end(); ++it) {
+                    task.params.responses_tool_map[it.key()] = it.value();
+                }
+            }
+
             // prepare child tasks
             if (task.params.n_cmpl > 1) {
                 int n_children = task.params.n_cmpl - 1;
@@ -4882,6 +4890,13 @@ void server_routes::init_routes() {
                 /* unsupported_image_as_text */ true);
             responses_apply_parser_fields(body_parsed, parser_parsed);
         }
+
+        // Inject tool mapping for output round-trip
+        json tool_map = build_responses_tool_map(response_body);
+        if (!tool_map.empty()) {
+            body_parsed["__responses_tool_map"] = tool_map;
+        }
+
         return handle_completions_impl(
             req,
             SERVER_TASK_TYPE_COMPLETION,

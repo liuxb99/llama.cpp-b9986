@@ -327,6 +327,59 @@ static std::vector<json> responses_tool_to_chatcmpl_tools(const json & resp_tool
     return result;
 }
 
+// Build a tool mapping from Responses tools array for reverse lookup during output.
+// Key: exposed function name → {original_type, original_name, namespace_name, ...}
+static json build_responses_tool_map(const json & response_body) {
+    json map_obj = json::object();
+    if (!response_body.contains("tools") || !response_body.at("tools").is_array()) {
+        return map_obj;
+    }
+    for (const auto & tool : response_body.at("tools")) {
+        const std::string type = json_value(tool, "type", std::string());
+        if (type == "function") {
+            const std::string name = sanitize_tool_name(
+                json_value(tool, "name", std::string()));
+            if (!name.empty()) {
+                map_obj[name] = json{{"original_type", "function"}, {"original_name", name}};
+            }
+        } else if (type == "namespace") {
+            const std::string ns_name = sanitize_tool_name(
+                json_value(tool, "name", std::string()), "namespace");
+            if (tool.contains("tools") && tool.at("tools").is_array()) {
+                for (const auto & sub : tool.at("tools")) {
+                    if (json_value(sub, "type", std::string()) != "function") {
+                        continue;
+                    }
+                    std::string sub_name = json_value(sub, "name", std::string());
+                    if (sub_name.empty()) { continue; }
+                    const std::string qualified = ns_name + "__" + sanitize_tool_name(sub_name);
+                    map_obj[qualified] = json{
+                        {"original_type", "namespace"},
+                        {"original_name", sub_name},
+                        {"namespace_name", json_value(tool, "name", std::string())},
+                    };
+                }
+            }
+        } else if (type == "custom") {
+            const std::string name = sanitize_tool_name(
+                json_value(tool, "name", std::string()), "custom_tool");
+            if (!name.empty()) {
+                json info = json{
+                    {"original_type", "custom"},
+                    {"original_name", json_value(tool, "name", std::string())},
+                };
+                map_obj[name] = info;
+            }
+        } else if (type == "tool_search") {
+            map_obj["tool_search"] = json{
+                {"original_type", "tool_search"},
+                {"description", json_value(tool, "description", std::string())},
+            };
+        }
+    }
+    return map_obj;
+}
+
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
         throw std::invalid_argument("'input' is required");

@@ -78,6 +78,10 @@ struct task_params {
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 
+    // tool type mapping for Responses API round-trip
+    // key: exposed function name → original tool info json
+    std::map<std::string, nlohmann::ordered_json> responses_tool_map;
+
     // response formatting
     bool               verbose  = false;
     task_response_type res_type = TASK_RESPONSE_TYPE_NONE;

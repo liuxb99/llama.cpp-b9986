@@ -694,6 +694,61 @@ static json build_responses_sse(const char * event, int & seq_num, const json & 
     return json {{"event", event}, {"data", data}};
 }
 
+
+// Restore original tool call type from mapping for Responses API round-trip.
+// Custom tools: extract raw input from {"input": "..."} wrapper -> custom_tool_call
+// Namespace/function/tool_search: keep as function_call with mapped name
+static json restore_responses_tool_call(
+    const common_chat_tool_call & tool_call,
+    const std::string & fc_item_id,
+    const std::string & status,
+    const std::map<std::string, nlohmann::ordered_json> & tool_map)
+{
+    // Default: function_call with sanitized name
+    const std::string default_name = sanitize_tool_name(tool_call.name);
+    auto it = tool_map.find(default_name);
+    if (it != tool_map.end()) {
+        const std::string orig_type = json_value(it->second, "original_type", std::string());
+        if (orig_type == "custom") {
+            // Extract raw input from {"input": "..."} wrapper
+            std::string raw_input = tool_call.arguments;
+            try {
+                json args = json::parse(tool_call.arguments);
+                if (args.is_object() && args.contains("input") && args["input"].is_string()) {
+                    raw_input = args["input"].get<std::string>();
+                }
+            } catch (...) {}
+            return json {
+                {"id",        fc_item_id},
+                {"type",      "custom_tool_call"},
+                {"status",    status},
+                {"arguments", raw_input},
+                {"call_id",   "call_" + tool_call.id},
+                {"name",      json_value(it->second, "original_name", tool_call.name)},
+            };
+        } else if (orig_type == "tool_search") {
+            return json {
+                {"id",        fc_item_id},
+                {"type",      "function_call"},
+                {"status",    status},
+                {"arguments", tool_call.arguments},
+                {"call_id",   "call_" + tool_call.id},
+                {"name",      "tool_search"},
+            };
+        }
+        // namespace and function: keep function_call
+    }
+    // Default: function_call with sanitized name
+    return json {
+        {"id",        fc_item_id},
+        {"type",      "function_call"},
+        {"status",    status},
+        {"arguments", tool_call.arguments},
+        {"call_id",   "call_" + tool_call.id},
+        {"name",      default_name},
+    };
+}
+
 json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     common_chat_msg msg;
     if (!oaicompat_msg.empty()) {
@@ -727,8 +782,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
             ? oai_resp_fc_item_ids[i]
             : "fc_" + random_string();
         const bool valid = tool_call_arguments_valid(tool_call);
-        output.push_back(build_responses_function_call_item(
-            tool_call, valid ? "completed" : "incomplete", fc_item_id));
+        output.push_back(restore_responses_tool_call(
+            tool_call, fc_item_id, valid ? "completed" : "incomplete",
+            generation_params.responses_tool_map));
         if (!valid) {
             has_incomplete_tool = true;
         }
@@ -805,22 +861,22 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
             ? oai_resp_fc_item_ids[i]
             : "fc_" + random_string();
         const bool valid = tool_call_arguments_valid(tool_call);
+        const json restored = restore_responses_tool_call(
+            tool_call, fc_item_id, valid ? "completed" : "incomplete",
+            generation_params.responses_tool_map);
+        const std::string restored_type = json_value(restored, "type", std::string("function_call"));
+        const std::string restored_name = json_value(restored, "name", tool_call.name);
 
-        if (valid) {
-            // function_call_arguments.done - only for complete tool calls
+        if (valid && restored_type == "function_call") {
+            // function_call_arguments.done - only for complete function_call items
             server_sent_events.push_back(json {{"event", "response.function_call_arguments.done"}, {"data", json{
                 {"type", "response.function_call_arguments.done"}, {"sequence_number", seq_num++},
                 {"output_index", output_idx},
-                {"item_id", fc_item_id}, {"name", tool_call.name},
+                {"item_id", fc_item_id}, {"name", restored_name},
             }}});
         }
 
-        const json output_item = {
-            {"id", fc_item_id}, {"type", "function_call"},
-            {"status", valid ? "completed" : "incomplete"},
-            {"arguments", tool_call.arguments}, {"call_id", "call_" + tool_call.id},
-            {"name", tool_call.name},
-        };
+        const json output_item = restored;
         server_sent_events.push_back(json {{"event", "response.output_item.done"}, {"data", json{
             {"type", "response.output_item.done"}, {"sequence_number", seq_num++},
             {"output_index", output_idx}, {"item", output_item},
