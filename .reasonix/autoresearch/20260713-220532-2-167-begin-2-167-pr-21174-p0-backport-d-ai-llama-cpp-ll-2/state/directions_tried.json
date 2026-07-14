@@ -1,0 +1,23 @@
+[
+  {
+    "fingerprint": "pr-21174-backport-commit-bc76a156",
+    "summary": "PR #21174 的完整 backport 已全部完成并推送。最终 commit 链：",
+    "first_seen_iteration": 1,
+    "last_seen_iteration": 1,
+    "count": 1
+  },
+  {
+    "fingerprint": "pr-21174-backport-78628791",
+    "summary": "PR #21174 完整 backport 已完成并推送。",
+    "first_seen_iteration": 2,
+    "last_seen_iteration": 2,
+    "count": 1
+  },
+  {
+    "fingerprint": "verification-complete-seven-checks-passed-in-this-enviro-ff69bcbe",
+    "summary": "Verification complete. Seven checks passed in this environment; three require your local setup:",
+    "first_seen_iteration": 3,
+    "last_seen_iteration": 3,
+    "count": 1
+  }
+]

@@ -70,9 +70,10 @@ static bool has_incomplete_tool_call(
     } catch (const std::exception &) {
         // fall through to fallback
     }
-    // No PEG-parsed tool calls; try <tool_call>/<invoke> fallback (Responses bridge)
+    // No PEG-parsed tool calls; try <tool_call>/<invoke>/<tool_search> fallback (Responses bridge)
     bool has_xml_tag = generated_text.find("<tool_call>") != std::string::npos ||
-                       generated_text.find("<invoke") != std::string::npos;
+                       generated_text.find("<invoke") != std::string::npos ||
+                       generated_text.find("<tool_search>") != std::string::npos;
     if (has_xml_tag) {
         common_chat_msg fallback_msg;
         if (parse_xml_tool_call_fallback(generated_text, true, parser_params.generation_prompt, fallback_msg, tool_map)) {

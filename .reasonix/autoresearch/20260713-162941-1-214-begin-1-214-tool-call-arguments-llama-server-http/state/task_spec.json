@@ -1,0 +1,25 @@
+{
+  "task_id": "20260713-162941-1-214-begin-1-214-tool-call-arguments-llama-server-http",
+  "goal": "[已貼上文字 #1 · 214 行]\n\n--- Begin [已貼上文字 #1 · 214 行] ---\n可以继续修改，但先做最小、安全修复。\r\n\r\n目标：\r\n\r\n不完整或非法的 tool-call arguments 不得让 llama-server 直接返回 HTTP 500，也不得被误标记为成功的 finish_reason=\"tool_calls\"。\r\n\r\n不要先实现“所有工具调用永不停止”，也不要先忽略全部 EOS/stop word。\r\n\r\n一、修改 common/chat.cpp\r\n\r\n位置：\r\n\r\nworkaround::func_args_not_string(json \u0026 messages)\r\n\r\n目前：\r\n\r\nargs = json::parse(args.get[std::string](std::string)());\r\n\r\n解析失败后直接 throw runtime_error。\r\n\r\n改为：\r\n\r\n1. 使用：\r\n\r\njson::parse(raw, nullptr, false)\r\n\r\n2. 合法 JSON：\r\n\r\n   * 正常替换为 object\r\n\r\n3. 非法 JSON：\r\n\r\n   * 不 throw\r\n   * 保留原始 string\r\n   * 记录 LOG_WRN\r\n   * 日志只记录长度、message index、tool index、tool name\r\n   * 不完整输出原始 arguments，避免敏感信息泄漏\r\n\r\n示意：\r\n\r\nif (args.is_string()) {\r\nconst std::string raw = args.get[std::string](std::string)();\r\njson parsed = json::parse(raw, nullptr, false);\r\n\r\n```\r\nif (!parsed.is_discarded()) {\r\n    args = std::move(parsed);\r\n} else {\r\n    LOG_WRN(\r\n        \"Malformed tool arguments preserved: message=%zu tool=%zu name='%s' length=%zu\\n\",\r\n        message_index,\r\n        tool_index,\r\n        tool_name.c_str(),\r\n        raw.size());\r\n}\r\n```\r\n\r\n}\r\n\r\n二、增加统一完整性判断函数\r\n\r\n在合适位置新增：\r\n\r\nbool tool_call_arguments_valid(const common_chat_tool_call \u0026 tool_call);\r\n\r\n判断：\r\n\r\n* arguments 非空\r\n* 能解析为 JSON\r\n* 解析结果必须是 object\r\n\r\n示意：\r\n\r\nstatic bool tool_call_arguments_valid(\r\nconst common_chat_tool_call \u0026 tool_call) {\r\nif (tool_call.arguments.empty()) {\r\nreturn false;\r\n}\r\n\r\n```\r\njson parsed = json::parse(\r\n    tool_call.arguments,\r\n    nullptr,\r\n    false);\r\n\r\nreturn !parsed.is_discarded() \u0026\u0026 parsed.is_object();\r\n```\r\n\r\n}\r\n\r\n再新增：\r\n\r\nbool all_tool_call_arguments_valid(\r\nconst std::vector\u003ccommon_chat_tool_call\u003e \u0026 calls);\r\n\r\n三、修改 tools/server/server-task.cpp\r\n\r\n位置：\r\n\r\nserver_task_result_cmpl_final::to_json_oaicompat_chat()\r\n\r\n目前：\r\n\r\nif (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {\r\nfinish_reason = msg.tool_calls.empty() ? \"stop\" : \"tool_calls\";\r\n}\r\n\r\n改为：\r\n\r\nif (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {\r\nif (msg.tool_calls.empty()) {\r\nfinish_reason = \"stop\";\r\n} else if (all_tool_call_arguments_valid(msg.tool_calls)) {\r\nfinish_reason = \"tool_calls\";\r\n} else {\r\nfinish_reason = \"length\";\r\n}\r\n}\r\n\r\n并在 verbose 或内部调试字段加入：\r\n\r\n\"__tool_call_incomplete\": true\r\n\r\n四、修改串流版本\r\n\r\n位置：\r\n\r\nserver_task_result_cmpl_final::to_json_oaicompat_chat_stream()\r\n\r\n同样只有全部 arguments 合法时，才允许：\r\n\r\nfinish_reason = \"tool_calls\"\r\n\r\n否则：\r\n\r\nfinish_reason = \"length\"\r\n\r\n并记录：\r\n\r\n__tool_call_incomplete = true\r\n\r\n五、不要执行未完成工具\r\n\r\n确认上层收到：\r\n\r\nfinish_reason = \"length\"\r\n\r\n时，不会把已有的 partial tool_calls 当作可执行工具。\r\n\r\n如果客户端仍执行 partial tool call，记录到文档：\r\n\r\ndocs/TOOL_CALL_CLIENT_COMPATIBILITY.md\r\n\r\n说明 OpenCode 客户端也需要检查 arguments JSON。\r\n\r\n六、第二阶段再处理截断\r\n\r\n先完成以上修复后，再观察 /v1/chat/completions 是否仍有真实截断。\r\n\r\n只有再次捕获到：\r\n\r\n* STOP_TYPE_WORD\r\n* STOP_TYPE_EOS\r\n* STOP_TYPE_LIMIT\r\n\r\n导致 incomplete tool call 时，才在 process_token() 做“工具生成期间延迟停止”的第二阶段修改。\r\n\r\n不要一次把所有 stop 条件都取消。\r\n\r\n七、测试\r\n\r\n至少新增：\r\n\r\n1. 合法 arguments object\r\n2. 空 arguments\r\n3. 缺少结尾双引号\r\n4. 缺少 }\r\n5. PowerShell 管线停在 | Select\r\n6. malformed 历史消息不得 HTTP 500\r\n7. malformed arguments 不得 finish_reason=tool_calls\r\n8. 合法 arguments 正常 finish_reason=tool_calls\r\n9. stream 与非 stream 行为一致\r\n10. /v1/chat/completions 回归测试\r\n\r\n八、验证\r\n\r\n执行：\r\n\r\ngit diff --check\r\n\r\n增量编译：\r\n\r\ncmake --build build --config Release --target llama-server test-chat --parallel\r\n\r\n九、提交\r\n\r\n提交讯息：\r\n\r\nfix(chat): avoid failing on incomplete tool arguments\r\n\r\n推送：\r\n\r\ngit push origin master\r\n\r\n完成后回报：\r\n\r\n* 修改文件\r\n* 修改函数\r\n* 测试结果\r\n* 编译结果\r\n* commit hash\r\n* push 结果\r\n* /v1/chat/completions 是否仍会产生半截 tool call\r\n\n--- End [已貼上文字 #1 · 214 行] ---",
+  "scope": null,
+  "non_goals": null,
+  "allowed_operations": {
+    "write": true,
+    "network": false,
+    "publish": false
+  },
+  "success_criteria": [
+    {
+      "id": "objective_evidence",
+      "description": "The goal outcome is supported by direct evidence, such as inspected code, reproduced behavior, source material, or concrete findings.",
+      "required": true,
+      "evidence_ids": null
+    },
+    {
+      "id": "verification",
+      "description": "The result has relevant verification evidence, such as tests, commands, benchmarks, manual checks, or a documented reason why verification is not applicable.",
+      "required": true,
+      "evidence_ids": null
+    }
+  ]
+}

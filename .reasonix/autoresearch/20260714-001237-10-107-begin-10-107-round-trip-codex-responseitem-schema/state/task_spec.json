@@ -1,0 +1,27 @@
+{
+  "task_id": "20260714-001237-10-107-begin-10-107-round-trip-codex-responseitem-schema",
+  "goal": "[已貼上文字 #10 · 107 行]\n\n--- Begin [已貼上文字 #10 · 107 行] ---\n最新 round-trip 实现方向正确，但当前输出字段与 Codex 最新 ResponseItem schema 不一致，请做最小修复。\r\n\r\n对照 openai/codex：\r\n\r\ncodex-rs/app-server-protocol/schema/typescript/ResponseItem.ts\r\n\r\n一、修正 custom_tool_call\r\n\r\n当前错误：\r\n\r\n{\r\n\"type\": \"custom_tool_call\",\r\n\"arguments\": raw_input\r\n}\r\n\r\n必须改为：\r\n\r\n{\r\n\"type\": \"custom_tool_call\",\r\n\"input\": raw_input\r\n}\r\n\r\n保留：\r\n\r\n* id\r\n* call_id\r\n* name\r\n* status\r\n\r\n不得同时输出 arguments。\r\n\r\n二、修正 namespace function_call\r\n\r\n当前模型内部 exposed name：\r\n\r\nnamespace__tool_name\r\n\r\n可以保留。\r\n\r\n但回传 Codex 时必须查 mapping 并还原为：\r\n\r\n{\r\n\"type\": \"function_call\",\r\n\"name\": original_name,\r\n\"namespace\": namespace_name,\r\n\"arguments\": \"...\",\r\n\"call_id\": \"...\",\r\n\"id\": \"...\"\r\n}\r\n\r\n不得将 namespace__tool_name 原样交给 Codex。\r\n\r\n三、修正 tool_search\r\n\r\n不得还原为普通 function_call。\r\n\r\n必须输出 Codex schema 的：\r\n\r\n{\r\n\"type\": \"tool_search_call\",\r\n\"call_id\": \"...\",\r\n\"status\": \"...\",\r\n\"execution\": original execution,\r\n\"arguments\": parsed arguments\r\n}\r\n\r\nmapping 中增加保存：\r\n\r\n* execution\r\n* original tool_search JSON\r\n* parameters\r\n\r\n若 arguments 可以解析为 JSON，输出 JSON 值；否则保留字符串并标 incomplete。\r\n\r\n四、Streaming 事件\r\n\r\ncustom tool 不应发送：\r\n\r\nresponse.function_call_arguments.done\r\n\r\n需要按 Codex 当前事件协议确认 custom input 对应的 delta/done 事件。\r\n\r\n如果 llama.cpp 目前没有专用 custom input SSE event，至少：\r\n\r\n* output_item.done 使用正确 custom_tool_call item\r\n* response.completed 中 item 结构正确\r\n* 不要伪造 function_call_arguments.done\r\n\r\ntool_search 同理，不得使用 function_call_arguments.done 冒充。\r\n\r\n五、测试\r\n\r\n新增或修正测试：\r\n\r\n1. custom_tool_call 使用 input，不含 arguments\r\n2. namespace function_call 有 namespace 字段，name 为原始子工具名\r\n3. tool_search 输出 type=tool_search_call\r\n4. custom/tool_search 不发送 function_call_arguments.done\r\n5. 普通 function 保持原行为\r\n6. round-trip 后 Codex 不出现 unknown tool\r\n\r\n提交：\r\n\r\nfix(responses): align restored Codex tool items with current schema\r\n\r\n完成后编译并推送。\r\n\n--- End [已貼上文字 #10 · 107 行] ---",
+  "scope": null,
+  "non_goals": null,
+  "allowed_operations": {
+    "write": true,
+    "network": false,
+    "publish": false
+  },
+  "success_criteria": [
+    {
+      "id": "objective_evidence",
+      "description": "The goal outcome is supported by direct evidence, such as inspected code, reproduced behavior, source material, or concrete findings.",
+      "required": true,
+      "evidence_ids": [
+        "f1"
+      ]
+    },
+    {
+      "id": "verification",
+      "description": "The result has relevant verification evidence, such as tests, commands, benchmarks, manual checks, or a documented reason why verification is not applicable.",
+      "required": true,
+      "evidence_ids": null
+    }
+  ]
+}

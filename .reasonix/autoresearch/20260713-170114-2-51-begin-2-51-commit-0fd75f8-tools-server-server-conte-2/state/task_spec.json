@@ -1,0 +1,25 @@
+{
+  "task_id": "20260713-170114-2-51-begin-2-51-commit-0fd75f8-tools-server-server-conte-2",
+  "goal": "[已貼上文字 #2 · 51 行]\n\n--- Begin [已貼上文字 #2 · 51 行] ---\n检查发现 commit 0fd75f8 存在明确编译错误，请立即修复，只修改 tools/server/server-context.cpp。\n\n一、修复两个跨行字符串\n\n当前错误代码：\n\nSLT_WRN(slot, \"overriding EOS to complete tool call (extra_tokens=%d/%d)\n\",\nslot.n_tool_call_extra, MAX_TOOL_CALL_EXTRA);\n\nSLT_DBG(slot, \"tool call incomplete, continuing generation (extra_tokens=%d/%d)\n\",\nslot.n_tool_call_extra, MAX_TOOL_CALL_EXTRA);\n\n改为：\n\nSLT_WRN(\nslot,\n\"overriding EOS to complete tool call (extra_tokens=%d/%d)\\n\",\nslot.n_tool_call_extra,\nMAX_TOOL_CALL_EXTRA);\n\nSLT_DBG(\nslot,\n\"tool call incomplete, continuing generation (extra_tokens=%d/%d)\\n\",\nslot.n_tool_call_extra,\nMAX_TOOL_CALL_EXTRA);\n\n二、检查 EOG 覆盖逻辑\n\n目前 EOG token 已经被加入 generated_text 并被 sampler accept 后，才将 has_next_token 改回 true。\n\n先不要大改架构，但至少确认：\n\nEOG token piece 不会保留在 tool arguments 中\n不会连续重复生成同一个 EOG\n若无法安全忽略 EOG，先只对 STOP_TYPE_WORD、STOP_TYPE_LIMIT、time limit 延长，不覆盖 STOP_TYPE_EOS\n\n更安全的临时方案：\n\nif (overridden_stop == STOP_TYPE_EOS) {\n不继续生成；\n保持 EOS 停止；\n让 finish_reason 报 length + __tool_call_incomplete；\n}\n\n先不要强行越过 EOS，除非已有测试证明 sampler 可以从 EOG 后正常继续。\n\n三、立即执行\n\ngit diff --check\n--- End [已貼上文字 #2 · 51 行] ---四、提交\n\ngit add tools/server/server-context.cpp\ngit commit -m \"fix(server): correct incomplete tool-call continuation logging\"\ngit push origin master",
+  "scope": null,
+  "non_goals": null,
+  "allowed_operations": {
+    "write": true,
+    "network": false,
+    "publish": false
+  },
+  "success_criteria": [
+    {
+      "id": "objective_evidence",
+      "description": "The goal outcome is supported by direct evidence, such as inspected code, reproduced behavior, source material, or concrete findings.",
+      "required": true,
+      "evidence_ids": null
+    },
+    {
+      "id": "verification",
+      "description": "The result has relevant verification evidence, such as tests, commands, benchmarks, manual checks, or a documented reason why verification is not applicable.",
+      "required": true,
+      "evidence_ids": null
+    }
+  ]
+}

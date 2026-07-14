@@ -2079,6 +2079,107 @@ static void test_convert_responses_to_chatcmpl() {
         assert_equals((size_t)1, msg.tool_calls.size());
         assert_equals(std::string("fnX"), msg.tool_calls[0].name);
     }
+
+    // Test <tool_search> format accepted with tool_map
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["tool_search"]["original_type"] = "tool_search";
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "need to find <tool_search>deploy vercel app</tool_search> tools",
+            false, "", msg, &tool_map);
+        assert_equals(std::string("need to find  tools"), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("tool_search"), msg.tool_calls[0].name);
+    }
+
+    // Test <tool_search> partial during streaming
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["tool_search"]["original_type"] = "tool_search";
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "<tool_search>searching for",
+            true, "", msg, &tool_map);
+        assert_equals(std::string(""), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("tool_search"), msg.tool_calls[0].name);
+    }
+
+    // Test resolve_tool_name exact match
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["get_weather"]["original_type"] = "function";
+        tool_map["get_weather"]["original_name"] = "get_weather";
+        std::string r = resolve_tool_name("get_weather", "", tool_map);
+        assert_equals(std::string("get_weather"), r);
+    }
+
+    // Test resolve_tool_name by sanitized key
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["get_weather"]["original_type"] = "function";
+        std::string r = resolve_tool_name("GetWeather", "", tool_map);
+        assert_equals(std::string("get_weather"), r);
+    }
+
+    // Test resolve_tool_name by original_name
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["ns__create_branch"]["original_type"] = "function";
+        tool_map["ns__create_branch"]["original_name"] = "create_branch";
+        std::string r = resolve_tool_name("_create_branch", "ns", tool_map);
+        assert_equals(std::string(""), r); // not found by sanitized alone, nor unique
+    }
+
+    // Test resolve_tool_name by unique original_name (no namespace collision)
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["unique_fn"]["original_type"] = "function";
+        tool_map["unique_fn"]["original_name"] = "unique_fn";
+        std::string r = resolve_tool_name("unique_fn", "", tool_map);
+        assert_equals(std::string("unique_fn"), r);
+    }
+
+    // Test resolve_tool_name ambiguous rejection (5 cross-ns collisions)
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["canva__create_branch"]["original_type"] = "function";
+        tool_map["canva__create_branch"]["original_name"] = "_create_branch";
+        tool_map["supabase__create_branch"]["original_type"] = "function";
+        tool_map["supabase__create_branch"]["original_name"] = "_create_branch";
+        // "_create_branch" matches 2 entries → rejected
+        std::string r = resolve_tool_name("_create_branch", "", tool_map);
+        assert_equals(std::string(""), r);
+    }
+
+    // Test <tool_call> Format B with resolver
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["shell_command"]["original_type"] = "function";
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "<tool_call>{\"name\":\"shell_command\",\"arguments\":{\"cmd\":\"ls\"}}</tool_call>",
+            false, "", msg, &tool_map);
+        assert_equals(std::string(""), msg.content);
+        assert_equals((size_t)1, msg.tool_calls.size());
+        assert_equals(std::string("shell_command"), msg.tool_calls[0].name);
+    }
+
+    // Test mixed <tool_call> + <tool_search> in same text
+    {
+        std::map<std::string, nlohmann::ordered_json> tool_map;
+        tool_map["shell_command"]["original_type"] = "function";
+        tool_map["tool_search"]["original_type"] = "tool_search";
+        common_chat_msg msg;
+        parse_xml_tool_call_fallback(
+            "run <tool_call>shell_command{\"cmd\":\"ls\"}</tool_call> then <tool_search>find docs</tool_search>",
+            false, "", msg, &tool_map);
+        assert_equals(std::string("run  then "), msg.content);
+        assert_equals((size_t)2, msg.tool_calls.size());
+        assert_equals(std::string("shell_command"), msg.tool_calls[0].name);
+        assert_equals(std::string("tool_search"), msg.tool_calls[1].name);
+    }
 }
 
 // Shared LFM2 parser cases - all variants use one output format and parser

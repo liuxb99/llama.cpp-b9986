@@ -1,0 +1,27 @@
+{
+  "task_id": "20260713-215844-1-61-begin-1-61-llama-cpp-codex-cli-v1-responses-pr-2117",
+  "goal": "[已貼上文字 #1 · 61 行]\n\n--- Begin [已貼上文字 #1 · 61 行] ---\n已找到目前 llama.cpp 對 Codex CLI `/v1/responses` 支援最完整的官方分支：\r\n\r\nPR #21174\r\nbranch: responses-api-codex-compat\r\n作者分支：krystophny:responses-api-codex-compat\r\n\r\n不要直接 merge 整個分支。\r\n\r\n請將目前倉庫：\r\n\r\nD:\\AI-llama-cpp\\llama.cpp-b9986\r\n\r\n與 PR #21174 做逐文件比较，建立 backport 分析。\r\n\r\n重点比较：\r\n\r\n* tools/server/server-chat.cpp\r\n* tools/server/server-task.cpp\r\n* tools/server/server-context.cpp\r\n* tools/server/server-http.cpp\r\n* tools/server/server-schema.cpp\r\n* tools/server/tests/unit/test_compat_oai_responses.py\r\n* 其他 Responses API 测试文件\r\n\r\n目标：\r\n\r\n1. 找出 b9986 已经包含的功能\r\n2. 找出 #21174 新增但 b9986 缺失的功能\r\n3. 找出双方已经冲突或被后续重构取代的代码\r\n4. 不重复移植已经存在的逻辑\r\n5. 不覆盖当前 commit eb29686 的 incomplete tool-call 修复\r\n\r\n优先 backport：\r\n\r\n* function_call id/call_id 映射\r\n* sequence_number\r\n* output_index\r\n* content_index\r\n* response.created/in_progress 完整 response object\r\n* developer/system role 合并\r\n* Codex 非 function tools 兼容\r\n* Responses-only request key 清理\r\n* input_text 转换\r\n* Codex CLI E2E 测试\r\n\r\n先写：\r\n\r\ndocs/PR21174_CODEX_RESPONSES_BACKPORT_ANALYSIS.md\r\n\r\n报告必须包含：\r\n\r\n* #21174 每个 commit\r\n* 每个修改文件\r\n* b9986 是否已有\r\n* 是否需要 backport\r\n* 冲突风险\r\n* 最小 backport 顺序\r\n* 测试方案\r\n\r\n完成分析后再分小 commit 实作，不要一次复制整份 diff。\r\n\n--- End [已貼上文字 #1 · 61 行] ---",
+  "scope": null,
+  "non_goals": null,
+  "allowed_operations": {
+    "write": true,
+    "network": false,
+    "publish": false
+  },
+  "success_criteria": [
+    {
+      "id": "objective_evidence",
+      "description": "The goal outcome is supported by direct evidence, such as inspected code, reproduced behavior, source material, or concrete findings.",
+      "required": true,
+      "evidence_ids": [
+        "f1"
+      ]
+    },
+    {
+      "id": "verification",
+      "description": "The result has relevant verification evidence, such as tests, commands, benchmarks, manual checks, or a documented reason why verification is not applicable.",
+      "required": true,
+      "evidence_ids": null
+    }
+  ]
+}

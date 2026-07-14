@@ -1,0 +1,25 @@
+{
+  "task_id": "20260714-002739-1-160-begin-1-160-commit-80363c6f9-srv-wrn-no-compatible-2",
+  "goal": "[已貼上文字 #1 · 160 行]\n\n--- Begin [已貼上文字 #1 · 160 行] ---\ncommit 80363c6f9 当前存在明确问题，请立即修复，不要继续宣称完成。\r\n\r\n一、修复编译错误\r\n\r\n当前代码存在跨行字符串：\r\n\r\nSRV_WRN(\"no compatible client web-search tool available; web_search skipped\r\n\");\r\n\r\n改为合法 C++：\r\n\r\nSRV_WRN(\r\n\"%s\",\r\n\"no compatible client web-search tool available; web_search skipped\\n\");\r\n\r\n二、修复 tool mapping 被覆盖\r\n\r\n当前 server-context.cpp：\r\n\r\njson tool_map = json_value(body, \"__responses_tool_map\", json::object());\r\nif (tool_map.empty()) {\r\ntool_map = build_responses_tool_map(response_body);\r\n}\r\n\r\n这会在存在 web_search mapping 时丢失所有原有：\r\n\r\n* function\r\n* custom\r\n* namespace\r\n* tool_search\r\n\r\nmapping。\r\n\r\n必须改为先建立完整 map，再 merge web map：\r\n\r\njson tool_map = build_responses_tool_map(response_body);\r\n\r\nconst json extra_map =\r\njson_value(body, \"__responses_tool_map\", json::object());\r\n\r\nfor (auto it = extra_map.begin(); it != extra_map.end(); ++it) {\r\ntool_map[it.key()] = it.value();\r\n}\r\n\r\nbody.erase(\"__responses_tool_map\");\r\n\r\n三、不要从转换后的 chatcmpl_tools 猜原始类型\r\n\r\n当前 find_web_search_replacement() 返回的是已转成 type=function 的工具，因此：\r\n\r\nreplacement_original_type\r\n\r\n几乎永远是 function，无法知道原本是：\r\n\r\n* custom\r\n* namespace\r\n* function\r\n\r\n请改为在转换工具时同时保存 provenance：\r\n\r\nstruct converted_tool {\r\njson chatcmpl_tool;\r\nstd::string original_type;\r\nstd::string original_name;\r\nstd::string namespace_name;\r\n};\r\n\r\n或建立 exposed_name → original mapping 后，再用 exposed_name 查已有 mapping。\r\n\r\n不得从转换后的：\r\n\r\nreplacement[\"type\"]\r\n\r\n判断原始类型。\r\n\r\n四、明确 web search replacement 来源\r\n\r\nCodex request 和 OpenCode request 通常不是同一个客户端请求。\r\n\r\n不能假设 Codex tools[] 中一定包含 OpenCode 的 web-search 工具。\r\n\r\n请支持以下两种明确来源：\r\n\r\n1. Codex 当前请求中已注册的 MCP/web-search 替代工具\r\n2. llama-server 配置指定替代 exposed name，例如：\r\n\r\n--responses-web-search-tool namespace__web_search\r\n\r\n或环境/配置字段指定：\r\n\r\nresponses_web_search_tool = \"namespace__web_search\"\r\n\r\n自动模糊匹配只能作为 fallback，不能作为唯一方案。\r\n\r\n五、收紧自动匹配\r\n\r\n不要把通用名称直接视为网页搜索：\r\n\r\n* search\r\n* browser\r\n* fetch_url\r\n\r\n除非 description 明确同时包含公网/web/internet 与 search/fetch。\r\n\r\n所有比较转为小写后进行。\r\n\r\n排除关键词也必须大小写无关：\r\n\r\n* code\r\n* file\r\n* repository\r\n* grep\r\n* tool search\r\n* local\r\n\r\n六、参数映射\r\n\r\n当前只是复制 replacement schema，但没有真正做：\r\n\r\nquery → q\r\nquery → search_query\r\n\r\n模型调用 exposed web_search 后，回程必须根据 replacement schema 重命名字段。\r\n\r\n例如 replacement 只有 q：\r\n\r\n{\"query\":\"abc\"}\r\n\r\n必须还原为：\r\n\r\n{\"q\":\"abc\"}\r\n\r\n不能把 replacement 不接受的 query 原样返回。\r\n\r\n七、测试\r\n\r\n新增：\r\n\r\n1. web map 不覆盖 custom/namespace/tool_search map\r\n2. replacement 原始类型 custom 正确保留\r\n3. replacement namespace 正确保留 namespace/name\r\n4. query → q\r\n5. query → search_query\r\n6. 大小写 description 匹配\r\n7. 不误选 code/file/repository search\r\n8. 没有替代工具时安全 skip\r\n9. 跨行字符串编译检查\r\n10. mixed web_search + custom shell + namespace MCP round-trip\r\n\r\n完成后：\r\n\r\ngit diff --check\r\ncmake --build build --config Release --target llama-server --parallel 1\r\n\r\n提交：\r\n\r\nfix(responses): preserve tool mappings in web-search bridge\r\n\r\n推送后回报编译结果。\r\n\n--- End [已貼上文字 #1 · 160 行] ---",
+  "scope": null,
+  "non_goals": null,
+  "allowed_operations": {
+    "write": true,
+    "network": false,
+    "publish": false
+  },
+  "success_criteria": [
+    {
+      "id": "objective_evidence",
+      "description": "The goal outcome is supported by direct evidence, such as inspected code, reproduced behavior, source material, or concrete findings.",
+      "required": true,
+      "evidence_ids": null
+    },
+    {
+      "id": "verification",
+      "description": "The result has relevant verification evidence, such as tests, commands, benchmarks, manual checks, or a documented reason why verification is not applicable.",
+      "required": true,
+      "evidence_ids": null
+    }
+  ]
+}

@@ -503,18 +503,82 @@ static json find_web_search_replacement(
     return json();
 }
 
+std::string resolve_tool_name(
+    const std::string & name,
+    const std::string & namespace_name,
+    const std::map<std::string, nlohmann::ordered_json> & tool_map)
+{
+    if (tool_map.empty()) {
+        return ""; // non-null empty map: reject all
+    }
+    if (name.empty()) {
+        return "";
+    }
+
+    // Step 1: exact map key
+    auto it = tool_map.find(name);
+    if (it != tool_map.end()) {
+        return name;
+    }
+
+    // Step 2: sanitized key
+    std::string sanitized = sanitize_tool_name(name);
+    if (sanitized != name && !sanitized.empty()) {
+        it = tool_map.find(sanitized);
+        if (it != tool_map.end()) {
+            return sanitized;
+        }
+    }
+
+    // Step 3: namespace + original_name
+    if (!namespace_name.empty()) {
+        std::string ns_base = sanitize_tool_name(namespace_name);
+        std::string ns_key = ns_base + "__" + sanitized;
+        it = tool_map.find(ns_key);
+        if (it != tool_map.end()) {
+            return ns_key;
+        }
+        if (name != sanitized) {
+            ns_key = ns_base + "__" + name;
+            it = tool_map.find(ns_key);
+            if (it != tool_map.end()) {
+                return ns_key;
+            }
+        }
+    }
+
+    // Step 4: unique original_name (count matches across entire map)
+    std::string found_key;
+    int match_count = 0;
+    for (const auto & entry : tool_map) {
+        if (!entry.second.is_object()) continue;
+        std::string orig_name = json_value(entry.second, "original_name", std::string());
+        if (orig_name == name || orig_name == sanitized) {
+            found_key = entry.first;
+            match_count++;
+        }
+    }
+
+    if (match_count == 1) {
+        return found_key;
+    }
+    if (match_count > 1) {
+        SRV_WRN("tool_map: ambiguous name '%s' matches %d entries, rejecting\n", name.c_str(), match_count);
+    }
+
+    return ""; // no match or ambiguous
+}
+
 // -------------------------------------------------
-// Helper: parse <invoke name="X"><parameter name="k">v</parameter></invoke>
-// Returns true and fills name + ordered_json params object.
-static bool parse_invoke_block(
+// Parse <invoke name="X"><parameter name="k">v</parameter></invoke> from position.
+static bool parse_invoke_at(
     const std::string & text,
-    size_t block_start,
+    size_t tag_pos,
     size_t block_end,
     std::string & out_name,
-    nlohmann::ordered_json & out_params)
+    std::string & out_args)
 {
-    // Find name="..." attribute in opening tag
-    size_t na = text.find("name=\"", block_start);
+    size_t na = text.find("name=\"", tag_pos);
     if (na == std::string::npos || na >= block_end) return false;
     na += 6;
     if (na >= text.size()) return false;
@@ -523,15 +587,12 @@ static bool parse_invoke_block(
     out_name = text.substr(na, ne - na);
     if (out_name.empty()) return false;
 
-    // Find end of opening <invoke ...>
     size_t ote = text.find(">", ne);
     if (ote == std::string::npos || ote >= block_end) return false;
 
-    // Find </invoke>
     size_t cte = text.rfind("</invoke>", block_end);
     if (cte == std::string::npos || cte < ote) return false;
 
-    // Parse <parameter name="...">value</parameter> inside
     nlohmann::ordered_json params = nlohmann::ordered_json::object();
     size_t pp = ote + 1;
     while (pp < cte) {
@@ -541,118 +602,180 @@ static bool parse_invoke_block(
         size_t pne = text.find("\"", ps);
         if (pne == std::string::npos || pne >= cte) break;
         std::string pn = text.substr(ps, pne - ps);
-
         size_t tc = text.find(">", pne);
         if (tc == std::string::npos || tc >= cte) break;
-
         size_t pc = text.find("</parameter>", tc + 1);
         if (pc == std::string::npos || pc >= cte) break;
-
         params[pn] = text.substr(tc + 1, pc - tc - 1);
         pp = pc + 12;
     }
 
-    out_params = std::move(params);
+    out_args = params.dump();
     return true;
 }
 
-bool parse_xml_tool_call_fallback(
+// -------------------------------------------------
+// JSON object scan with brace matching and string awareness.
+static std::string scan_json_block(const std::string & text, size_t start, size_t end, size_t & out_end) {
+    bool in_string = false, escaped = false;
+    int depth = 0;
+    size_t json_start = 0;
+    for (size_t ci = start; ci < end; ci++) {
+        char c = text[ci];
+        if (escaped) { escaped = false; continue; }
+        if (c == '\\' && in_string) { escaped = true; continue; }
+        if (c == '"') { in_string = !in_string; continue; }
+        if (!in_string) {
+            if (c == '{') {
+                if (depth == 0) json_start = ci;
+                depth++;
+            } else if (c == '}') {
+                depth--;
+                if (depth == 0) {
+                    out_end = ci;
+                    return text.substr(json_start, ci - json_start + 1);
+                }
+            }
+        }
+    }
+    out_end = end;
+    return text.substr(json_start, end - json_start);
+}
+
+// -------------------------------------------------
+// Main unified parser: discovers all XML/JSON tool-call blocks in text
+// and resolves each through the tool_map.
+void parse_normalized_tool_calls(
     const std::string & raw_text,
     bool is_partial,
     const std::string & gen_prompt,
-    common_chat_msg & msg,
-    const std::map<std::string, nlohmann::ordered_json> * tool_map) {
+    const std::map<std::string, nlohmann::ordered_json> * tool_map,
+    std::vector<NormalizedToolCall> & out_calls,
+    std::string & clean_content)
+{
+    out_calls.clear();
+    clean_content.clear();
 
     std::string text = raw_text;
     if (!gen_prompt.empty() && text.substr(0, gen_prompt.size()) == gen_prompt) {
         text = text.substr(gen_prompt.size());
     }
 
-    if (text.find("<tool_call>") == std::string::npos &&
-        text.find("<invoke") == std::string::npos) {
-        return false;
+    static const std::string TAG_TOOL_CALL = "<tool_call>";
+    static const std::string TAG_INVOKE    = "<invoke";
+    static const std::string TAG_TOOL_SEARCH = "<tool_search>";
+
+    bool found_any =
+        text.find(TAG_TOOL_CALL) != std::string::npos ||
+        text.find(TAG_INVOKE) != std::string::npos ||
+        text.find(TAG_TOOL_SEARCH) != std::string::npos;
+
+    if (!found_any) {
+        clean_content = text;
+        return;
     }
-
-    // Pre-compute tool name lookup from map
-    // Build a set of all known tool names (function/custom/namespace/tool_search/web_search)
-    std::set<std::string> known_names;
-    if (tool_map) {
-        for (const auto & entry : *tool_map) {
-            known_names.insert(entry.first);
-        }
-    }
-
-    // Helper: check if a parsed tool name is valid (in map, or no map = accept all)
-    auto name_accepted = [&](const std::string & name) -> bool {
-        return !tool_map || known_names.count(sanitize_tool_name(name)) > 0;
-    };
-
-    std::string clean_content;
-    std::vector<common_chat_tool_call> calls;
 
     size_t pos = 0;
 
     while (pos < text.size()) {
-        // Find earliest XML tag
-        size_t ts = text.find("<tool_call>", pos);
-        size_t ti = text.find("<invoke", pos);
+        size_t tc  = text.find(TAG_TOOL_CALL, pos);
+        size_t ti  = text.find(TAG_INVOKE, pos);
+        size_t tse = text.find(TAG_TOOL_SEARCH, pos);
 
-        size_t tag_pos;
-        bool is_invoke;
+        // Pick earliest tag
+        size_t best = std::string::npos;
+        int kind = 0; // 1 = tool_call, 2 = invoke, 3 = tool_search
+        if (tc != std::string::npos  && tc < best) { best = tc;  kind = 1; }
+        if (ti != std::string::npos  && ti < best) { best = ti;  kind = 2; }
+        if (tse != std::string::npos && tse < best) { best = tse; kind = 3; }
 
-        if (ts == std::string::npos && ti == std::string::npos) {
+        if (best == std::string::npos) {
             clean_content += text.substr(pos);
             break;
-        } else if (ts == std::string::npos) {
-            tag_pos = ti; is_invoke = true;
-        } else if (ti == std::string::npos) {
-            tag_pos = ts; is_invoke = false;
-        } else {
-            tag_pos = std::min(ts, ti);
-            is_invoke = (tag_pos == ti);
         }
 
-        // Text before this tag stays as content
-        if (tag_pos > pos) {
-            clean_content += text.substr(pos, tag_pos - pos);
+        if (best > pos) {
+            clean_content += text.substr(pos, best - pos);
         }
 
-        // ======================= <invoke name="X"> handler =======================
-        if (is_invoke) {
-            // Find closing </invoke>
-            size_t ite = text.find("</invoke>", tag_pos);
-            size_t block_end = (ite != std::string::npos) ? ite + 9 : text.size();
+        // ============== <tool_search> handler ==============
+        if (kind == 3) {
+            size_t close = text.find("</tool_search>", best + TAG_TOOL_SEARCH.size());
+            size_t block_end = (close != std::string::npos) ? close + 14 : text.size();
+            size_t inner_start = best + TAG_TOOL_SEARCH.size();
+            std::string query;
+            if (close != std::string::npos) {
+                query = text.substr(inner_start, close - inner_start);
+                // Trim whitespace
+                size_t qs = query.find_first_not_of(" \t\n\r");
+                size_t qe = query.find_last_not_of(" \t\n\r");
+                if (qs != std::string::npos && qe != std::string::npos) {
+                    query = query.substr(qs, qe - qs + 1);
+                } else {
+                    query.clear();
+                }
+            } else if (is_partial) {
+                query = text.substr(inner_start);
+            }
 
-            std::string invoke_name;
-            nlohmann::ordered_json invoke_params;
-            bool parsed_ok = parse_invoke_block(text, tag_pos, block_end, invoke_name, invoke_params);
+            NormalizedToolCall ntc;
+            ntc.name = "tool_search";
+            ntc.arguments = query.empty() ? "{}" : "{\"query\":\"" + query + "\"}";
+            ntc.source_format = "tool_search";
+            ntc.partial = (close == std::string::npos) && is_partial;
 
-            bool accepted = parsed_ok && name_accepted(invoke_name);
-
-            if (accepted) {
-                // Accepted: emit tool call, strip from content
-                common_chat_tool_call call;
-                call.name = std::move(invoke_name);
-                call.arguments = invoke_params.dump();
-                calls.push_back(std::move(call));
+            // Resolve name
+            std::string resolved = tool_map ? resolve_tool_name(ntc.name, "", *tool_map) : ntc.name;
+            if (resolved.empty()) {
+                clean_content += text.substr(best, block_end - best);
             } else {
-                // Rejected: keep raw block as content
-                clean_content += text.substr(tag_pos, block_end - tag_pos);
+                ntc.name = resolved;
+                out_calls.push_back(std::move(ntc));
             }
 
             pos = block_end;
             continue;
         }
 
-        // ======================= <tool_call> handler =======================
-        // Determine search boundary: at most up to </tool_call>
-        size_t ci = tag_pos + 11;
-        size_t tag_end = text.find("</tool_call>", ci);
+        // ============== <invoke name="X"> handler ==============
+        if (kind == 2) {
+            size_t close = text.find("</invoke>", best);
+            size_t block_end = (close != std::string::npos) ? close + 9 : text.size();
+
+            std::string inv_name;
+            std::string inv_args;
+            bool parsed_ok = parse_invoke_at(text, best, block_end, inv_name, inv_args);
+
+            if (parsed_ok) {
+                std::string resolved = tool_map ? resolve_tool_name(inv_name, "", *tool_map) : inv_name;
+                if (resolved.empty()) {
+                    parsed_ok = false;
+                } else {
+                    NormalizedToolCall ntc;
+                    ntc.name = resolved;
+                    ntc.arguments = inv_args;
+                    ntc.source_format = "invoke";
+                    ntc.partial = (close == std::string::npos) && is_partial;
+                    out_calls.push_back(std::move(ntc));
+                }
+            }
+
+            if (!parsed_ok) {
+                clean_content += text.substr(best, block_end - best);
+            }
+            pos = block_end;
+            continue;
+        }
+
+        // ============== <tool_call> handler ==============
+        size_t inner_start = best + TAG_TOOL_CALL.size();
+        size_t tag_end = text.find("</tool_call>", inner_start);
         size_t block_end = (tag_end != std::string::npos) ? tag_end : text.size();
 
         bool any_accepted = false;
 
-        // Parse one or more name{json} pairs from ci
+        size_t ci = inner_start;
+
         while (ci < block_end) {
             // Skip whitespace
             while (ci < block_end && (text[ci] == ' ' || text[ci] == '\t' || text[ci] == '\n' || text[ci] == '\r')) {
@@ -673,143 +796,129 @@ bool parse_xml_tool_call_fallback(
                     ci++;
                 }
 
+                NormalizedToolCall ntc;
+                ntc.source_format = "tool_call";
+                ntc.arguments = "";
+
                 if (ci >= block_end || text[ci] != '{') {
-                    // Name with no JSON — accept in partial mode only
-                    if (is_partial && name_accepted(name)) {
-                        common_chat_tool_call call;
-                        call.name = std::move(name);
-                        calls.push_back(std::move(call));
-                        any_accepted = true;
+                    // Name with no JSON
+                    if (is_partial) {
+                        ntc.name = name;
+                        ntc.partial = true;
+                        std::string resolved = tool_map ? resolve_tool_name(name, "", *tool_map) : name;
+                        if (!resolved.empty()) {
+                            ntc.name = resolved;
+                            out_calls.push_back(std::move(ntc));
+                            any_accepted = true;
+                        }
                         ci = block_end;
                     }
                     break;
                 }
 
-                // Proper JSON scan — handle strings, escaped quotes, nested objects/arrays
-                common_chat_tool_call call;
-                call.name = std::move(name);
-                size_t json_start = ci;
-                bool in_string = false;
-                bool escaped = false;
-                int depth = 0;
-                size_t json_end = std::string::npos;
+                // Parse JSON block
+                size_t json_end;
+                std::string json_body = scan_json_block(text, ci, block_end, json_end);
+                ci = json_end + 1;
 
-                for (; ci < block_end; ci++) {
-                    char c = text[ci];
-
-                    if (escaped) {
-                        escaped = false;
-                        continue;
-                    }
-                    if (c == '\\' && in_string) {
-                        escaped = true;
-                        continue;
-                    }
-                    if (c == '"') {
-                        in_string = !in_string;
-                        continue;
-                    }
-                    if (!in_string) {
-                        if (c == '{') {
-                            if (depth == 0) {
-                                json_start = ci;
-                            }
-                            depth++;
-                        } else if (c == '}') {
-                            depth--;
-                            if (depth == 0) {
-                                json_end = ci;
-                                call.arguments = text.substr(json_start, ci - json_start + 1);
-                                ci++;
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                if (json_end != std::string::npos) {
-                    auto parsed_json = json::parse(call.arguments, nullptr, false);
-                    if (!parsed_json.is_discarded()) {
-                        if (name_accepted(call.name)) {
-                            calls.push_back(std::move(call));
+                auto parsed = json::parse(json_body, nullptr, false);
+                if (!parsed.is_discarded()) {
+                    if (tag_end != std::string::npos || is_partial) {
+                        ntc.name = name;
+                        ntc.arguments = json_body;
+                        ntc.partial = (tag_end == std::string::npos) && is_partial;
+                        std::string resolved = tool_map ? resolve_tool_name(name, "", *tool_map) : name;
+                        if (!resolved.empty()) {
+                            ntc.name = resolved;
+                            out_calls.push_back(std::move(ntc));
                             any_accepted = true;
                         }
-                        continue;   // next name{json} in same block
+                        continue;
                     }
-                    break;          // invalid JSON
+                    break;
                 } else if (is_partial) {
-                    call.arguments = text.substr(json_start, ci - json_start);
-                    if (name_accepted(call.name)) {
-                        calls.push_back(std::move(call));
+                    // Partial JSON — accept if name is acceptable
+                    std::string resolved = tool_map ? resolve_tool_name(name, "", *tool_map) : name;
+                    if (!resolved.empty()) {
+                        ntc.name = resolved;
+                        ntc.arguments = json_body;
+                        ntc.partial = true;
+                        out_calls.push_back(std::move(ntc));
                         any_accepted = true;
                     }
-                    ci = block_end; // stop scanning further
+                    ci = block_end;
                     break;
                 } else {
-                    break;          // non-partial with incomplete JSON
+                    break;
                 }
             }
 
             // ----- Format B: {"name":"...","arguments":{...}} -----
             if (text[ci] == '{') {
-                bool in_string = false;
-                bool escaped = false;
-                int depth = 0;
-                size_t json_end = std::string::npos;
+                size_t json_end;
+                std::string json_body = scan_json_block(text, ci, block_end, json_end);
 
-                for (size_t si = ci; si < block_end; si++) {
-                    char c = text[si];
-                    if (escaped) { escaped = false; continue; }
-                    if (c == '\\' && in_string) { escaped = true; continue; }
-                    if (c == '"') { in_string = !in_string; continue; }
-                    if (!in_string) {
-                        if (c == '{') depth++;
-                        else if (c == '}') {
-                            depth--;
-                            if (depth == 0) { json_end = si; break; }
+                auto parsed_json = json::parse(json_body, nullptr, false);
+                if (!parsed_json.is_discarded() && parsed_json.is_object()) {
+                    std::string fn_name = json_value(parsed_json, "name", std::string());
+                    json args_val = json_value(parsed_json, "arguments", json());
+                    if (!fn_name.empty() && !args_val.is_null()) {
+                        NormalizedToolCall ntc;
+                        ntc.source_format = "json";
+                        ntc.arguments = args_val.is_string() ? args_val.get<std::string>() : args_val.dump();
+                        ntc.partial = (tag_end == std::string::npos) && is_partial;
+                        std::string resolved = tool_map ? resolve_tool_name(fn_name, "", *tool_map) : fn_name;
+                        if (!resolved.empty()) {
+                            ntc.name = resolved;
+                            out_calls.push_back(std::move(ntc));
+                            any_accepted = true;
                         }
+                        ci = json_end + 1;
+                        continue;
                     }
                 }
-
-                if (json_end != std::string::npos) {
-                    std::string inner = text.substr(ci, json_end - ci + 1);
-                    auto parsed_json = json::parse(inner, nullptr, false);
-                    if (!parsed_json.is_discarded() && parsed_json.is_object()) {
-                        std::string fn_name = json_value(parsed_json, "name", std::string());
-                        if (!fn_name.empty() && parsed_json.contains("arguments")) {
-                            if (name_accepted(fn_name)) {
-                                common_chat_tool_call call;
-                                call.name = std::move(fn_name);
-                                call.arguments = parsed_json["arguments"].dump();
-                                calls.push_back(std::move(call));
-                                any_accepted = true;
-                            }
-                            ci = json_end + 1;
-                            continue;
-                        }
-                    }
-                }
-                break; // only one JSON object for Format B
+                break;
             }
 
-            break; // unrecognized character
+            break; // unrecognized
         }
 
-        // Move past this block
-        if (tag_end != std::string::npos) {
-            // If no calls were accepted from this block, keep raw text as content
-            if (!any_accepted) {
-                clean_content += text.substr(tag_pos, tag_end + 12 - tag_pos);
-            }
-            pos = tag_end + 12;
-        } else {
-            pos = text.size();
+        // Block disposition: if none accepted, keep raw text
+        if (!any_accepted) {
+            clean_content += text.substr(best, (tag_end != std::string::npos ? tag_end + 12 : text.size()) - best);
         }
+        pos = (tag_end != std::string::npos) ? tag_end + 12 : text.size();
     }
+}
+
+void normalized_calls_to_chat_msg(
+    common_chat_msg & msg,
+    const std::vector<NormalizedToolCall> & calls)
+{
+    msg.content.clear();
+    msg.tool_calls.clear();
+    for (const auto & ntc : calls) {
+        common_chat_tool_call tc;
+        tc.name = ntc.name;
+        tc.arguments = ntc.arguments;
+        msg.tool_calls.push_back(std::move(tc));
+    }
+}
+
+bool parse_xml_tool_call_fallback(
+    const std::string & raw_text,
+    bool is_partial,
+    const std::string & gen_prompt,
+    common_chat_msg & msg,
+    const std::map<std::string, nlohmann::ordered_json> * tool_map) {
+
+    std::vector<NormalizedToolCall> calls;
+    std::string clean_content;
+    parse_normalized_tool_calls(raw_text, is_partial, gen_prompt, tool_map, calls, clean_content);
 
     msg.content = clean_content;
     if (!calls.empty()) {
-        msg.tool_calls = std::move(calls);
+        normalized_calls_to_chat_msg(msg, calls);
         return true;
     }
     return false;

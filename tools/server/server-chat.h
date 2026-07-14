@@ -49,11 +49,51 @@ static inline uint32_t resp_ctx_next_seq() {
 // Sanitize a tool/function name for use as a JSON key
 std::string sanitize_tool_name(const std::string & name, const std::string & fallback = "tool");
 
-// Convert OpenAI Responses API format to OpenAI Chat Completions API format
-json server_chat_convert_responses_to_chatcmpl(const json & body);
+// ---------------------------------------------------------------------------
+// Unified tool normalizer for Responses bridge
+// Converts model output in any known XML/JSON format into normalized tool calls
+// and resolves them against the responses_tool_map.
+// ---------------------------------------------------------------------------
 
-// Build tool mapping from Responses tools for reverse lookup during output
-json build_responses_tool_map(const json & response_body);
+struct NormalizedToolCall {
+    std::string name;           // raw name from source
+    std::string arguments;      // JSON string
+    std::string namespace_name; // namespace if resolved from mapping
+    std::string source_format;  // "tool_call", "invoke", "tool_search", "json"
+    bool partial = false;       // incomplete during streaming
+};
+
+// Resolve a raw tool name against the tool_map following strict priority:
+//   1. exact map key
+//   2. sanitized key
+//   3. namespace + original_name
+//   4. unique original_name  (reject if ambiguous)
+// Returns empty string on no match or ambiguity.
+std::string resolve_tool_name(
+    const std::string & name,
+    const std::string & namespace_name,
+    const std::map<std::string, nlohmann::ordered_json> & tool_map);
+
+// Parse model output text into normalized tool calls, resolving names
+// against the optional tool_map.  Formats supported:
+//   <tool_call>name{json}</tool_call>
+//   <tool_call>{name:..., arguments:...}</tool_call>
+//   <invoke name=X><parameter name=k>v</parameter></invoke>
+//   <tool_search>query text</tool_search>
+// Unmatched or ambiguous calls are kept as content text.
+void parse_normalized_tool_calls(
+    const std::string & text,
+    bool is_partial,
+    const std::string & gen_prompt,
+    const std::map<std::string, nlohmann::ordered_json> * tool_map,
+    std::vector<NormalizedToolCall> & out_calls,
+    std::string & clean_content);
+
+// Convert a vector of NormalizedToolCall into a common_chat_msg
+// (populates msg.content, msg.tool_calls).
+void normalized_calls_to_chat_msg(
+    common_chat_msg & msg,
+    const std::vector<NormalizedToolCall> & calls);
 
 // Parse <tool_call>name{json}</tool_call> format from generated text without invoking
 // the full PEG tool-call grammar (used when tools are not injected into model prompt).

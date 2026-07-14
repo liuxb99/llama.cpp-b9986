@@ -1,0 +1,27 @@
+{
+  "task_id": "20260714-000507-9-130-begin-9-130-125825b8b-namespace-function-custom-fu",
+  "goal": "[已貼上文字 #9 · 130 行]\n\n--- Begin [已貼上文字 #9 · 130 行] ---\n对，沿用当前已经完成的转换代码，不要重做。\r\n\r\n当前 `125825b8b` 已经完成：\r\n\r\n* namespace → 临时 function\r\n* custom → 临时 function\r\n* tool_search → 临时 function\r\n\r\n现在只补“回程还原”，让 llama.cpp 成为透明传话层。\r\n\r\n目标：\r\n\r\nCodex 原始工具定义\r\n→ 转成模型可理解的 function\r\n→ 模型生成 function call\r\n→ 根据 request-local mapping 还原为 Codex 原始工具调用\r\n→ 返回给 Codex 执行\r\n\r\n一、建立 request-local tool mapping\r\n\r\n映射至少保存：\r\n\r\n* exposed_name\r\n* original_type\r\n* original_name\r\n* namespace_name\r\n* input_mode\r\n* original_tool_json\r\n\r\n禁止使用全局 static map，避免并发请求串线。\r\n\r\n映射必须存入 server task/request state，并随着该请求传递到：\r\n\r\n* partial streaming result\r\n* final result\r\n* Responses JSON/SSE formatter\r\n\r\n二、沿用当前 exposed name\r\n\r\nnamespace：\r\n\r\n`namespace__tool_name`\r\n\r\ncustom：\r\n\r\n当前 sanitize 后的工具名\r\n\r\ntool_search：\r\n\r\n`tool_search`\r\n\r\n不要改变模型看到的 schema，只增加映射记录。\r\n\r\n三、回传前还原\r\n\r\n普通 function：\r\n\r\n* 保持 `function_call`\r\n\r\ncustom：\r\n\r\n* 从 arguments JSON 中取出 `input`\r\n* 返回 Codex 原始 custom tool call item\r\n* payload 使用原始 free-form 字符串\r\n* 不再作为普通 function_call 返回\r\n\r\nnamespace：\r\n\r\n* 将 `namespace__tool_name` 查表\r\n* 还原原 namespace 与原子工具名称\r\n* 按 Codex 当前实际协议返回对应 call item\r\n* 不得把加前缀后的名称直接交给 Codex\r\n\r\ntool_search：\r\n\r\n* 还原为 Codex 原始 tool_search call\r\n* llama.cpp 不执行搜索，只传回 Codex\r\n\r\n四、streaming 同步还原\r\n\r\n以下事件都必须使用还原后的类型、名称和 payload：\r\n\r\n* response.output_item.added\r\n* arguments/input delta\r\n* arguments/input done\r\n* response.output_item.done\r\n* response.completed\r\n\r\nitem_id、call_id、sequence_number、output_index 保持现有实现。\r\n\r\n五、多轮历史\r\n\r\n下一轮 Codex 送回原始：\r\n\r\n* custom tool call/output\r\n* namespace tool call/output\r\n* tool_search call/result\r\n\r\n继续用当前 Responses → Chat 转换路径转入模型历史。\r\n\r\n六、安全规则\r\n\r\n* custom free-form 只验证包裹 JSON 是否完整，再取出 input\r\n* namespace/function 保持 JSON object 验证\r\n* incomplete call 不得 completed\r\n* mapping 查不到时不得猜测；返回结构化错误并记录 exposed_name\r\n\r\n七、测试\r\n\r\n必须覆盖：\r\n\r\n1. custom shell 完整 round-trip\r\n2. custom apply_patch 完整 round-trip\r\n3. namespace MCP tool round-trip\r\n4. tool_search round-trip\r\n5. 普通 function 不受影响\r\n6. 两个 namespace 同名工具\r\n7. 并发请求 mapping 不串线\r\n8. streaming 与 non-streaming 一致\r\n9. incomplete custom 不 completed\r\n10. Codex 不出现 unknown tool\r\n\r\n提交：\r\n\r\nserver: restore native Codex tool calls after model bridge\r\n\r\ntests: verify bidirectional Codex tool mapping\r\n\r\n完成后推送，并回报实际 Codex 协议中的 item type 与字段。\r\n\n--- End [已貼上文字 #9 · 130 行] ---",
+  "scope": null,
+  "non_goals": null,
+  "allowed_operations": {
+    "write": true,
+    "network": false,
+    "publish": false
+  },
+  "success_criteria": [
+    {
+      "id": "objective_evidence",
+      "description": "The goal outcome is supported by direct evidence, such as inspected code, reproduced behavior, source material, or concrete findings.",
+      "required": true,
+      "evidence_ids": [
+        "f1"
+      ]
+    },
+    {
+      "id": "verification",
+      "description": "The result has relevant verification evidence, such as tests, commands, benchmarks, manual checks, or a documented reason why verification is not applicable.",
+      "required": true,
+      "evidence_ids": null
+    }
+  ]
+}
