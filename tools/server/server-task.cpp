@@ -1,5 +1,6 @@
 #include "server-task.h"
 
+#include <algorithm>
 #include "build-info.h"
 #include "server-chat.h"
 #include "chat.h"
@@ -759,12 +760,52 @@ static json restore_responses_tool_call(
             const std::string repl_exposed = json_value(it->second, "replacement_exposed_name", std::string());
             const std::string repl_type = json_value(it->second, "replacement_original_type", std::string("function"));
             const std::string repl_name = json_value(it->second, "replacement_original_name", std::string());
+
+            // Parameter remapping: model was exposed "query" but replacement may use "q" or "search_query"
+            // Only forward fields that the replacement schema accepts
+            std::string args_out = tool_call.arguments;
+            try {
+                json args = json::parse(tool_call.arguments);
+                if (args.is_object()) {
+                    // Get the replacement parameter schema
+                    json repl_params = json_value(it->second, "replacement_parameters", json::object());
+                    json repl_props = json_value(repl_params, "properties", json::object());
+                    if (!repl_props.empty()) {
+                        // Build remapped args: only include keys accepted by replacement schema
+                        json remapped = json::object();
+                        for (auto & prop : args.items()) {
+                            const std::string & key = prop.key();
+                            if (repl_props.contains(key)) {
+                                // Key is directly accepted
+                                remapped[key] = prop.value();
+                            } else if (key == "query") {
+                                // Try to remap query → first param that looks like a query field
+                                if (repl_props.contains("q")) {
+                                    remapped["q"] = prop.value();
+                                } else if (repl_props.contains("search_query")) {
+                                    remapped["search_query"] = prop.value();
+                                }
+                            }
+                        }
+                        if (!remapped.empty()) {
+                            args_out = remapped.dump();
+                        }
+                    }
+                }
+            } catch (...) {}
+
             if (repl_type == "custom") {
                 std::string raw_input = tool_call.arguments;
                 try {
-                    json args = json::parse(tool_call.arguments);
-                    if (args.is_object() && args.contains("query") && args["query"].is_string()) {
-                        raw_input = args["query"].get<std::string>();
+                    json args = json::parse(args_out);
+                    if (args.is_object()) {
+                        // For custom tools, extract the first string value as raw input
+                        for (auto & prop : args.items()) {
+                            if (prop.value().is_string()) {
+                                raw_input = prop.value().get<std::string>();
+                                break;
+                            }
+                        }
                     }
                 } catch (...) {}
                 return json {
@@ -772,10 +813,10 @@ static json restore_responses_tool_call(
                     {"input", raw_input}, {"call_id", "call_" + tool_call.id}, {"name", repl_name},
                 };
             }
-            // Default: function_call
+            // Default: function_call with remapped arguments
             return json {
                 {"id", fc_item_id}, {"type", "function_call"}, {"status", status},
-                {"arguments", tool_call.arguments}, {"call_id", "call_" + tool_call.id},
+                {"arguments", args_out}, {"call_id", "call_" + tool_call.id},
                 {"name", repl_name.empty() ? "web_search" : repl_name},
             };
         }

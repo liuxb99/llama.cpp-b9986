@@ -446,7 +446,7 @@ def test_responses_reasoning_content_string():
     assert res.body["status"] == "completed"
 def test_responses_reasoning_content_null():
     """Reasoning items with content:null (Codex format, issue openai/codex#11834)
-    must be accepted  content may be null when encrypted_content is present."""
+    must be accepted � content may be null when encrypted_content is present."""
     res = server.make_request("POST", "/v1/responses", data={
         "model": "gpt-4.1",
         "input": [
@@ -864,3 +864,138 @@ def test_responses_concurrent_tool_map():
                    "parameters": {"type": "object", "properties": {"x": {"type": "string"}}}}],
     })
     assert res.status_code == 200
+
+
+# ── Web-search bridge tests ──────────────────────────────────────────────
+
+def test_web_search_replacement_no_override_custom_namespace():
+    """Web search mapping must not overwrite custom/namespace/tool_search maps."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "function", "name": "get_weather", "description": "Get weather",
+             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
+            {"type": "namespace", "name": "mcp", "description": "MCP", "tools": [
+                {"type": "function", "name": "read_file", "description": "Read file",
+                 "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
+            ]},
+            {"type": "custom", "name": "exec", "description": "Execute a shell command"},
+            {"type": "tool_search", "execution": "sync", "description": "Search tools"},
+            {"type": "web_search"},
+        ],
+    })
+
+
+def test_web_search_replacement_custom_type_preserved():
+    """Custom tool used as web_search replacement must retain original_type=custom."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "custom", "name": "web_search", "description": "Search the web for information"},
+            {"type": "web_search"},
+        ],
+    })
+
+
+def test_web_search_replacement_namespace_preserved():
+    """Namespace tool used as web_search replacement must retain original_type=namespace with name."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "namespace", "name": "search", "description": "Web search namespace", "tools": [
+                {"type": "function", "name": "web_search", "description": "Search the web",
+                 "parameters": {"type": "object", "properties": {"q": {"type": "string"}}}},
+            ]},
+            {"type": "web_search"},
+        ],
+    })
+
+
+def test_web_search_param_query_to_q():
+    """query parameter must remap to q when replacement expects q."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "function", "name": "web_search", "description": "Search the web",
+             "parameters": {"type": "object", "properties": {"q": {"type": "string"}},
+                            "required": ["q"]}},
+            {"type": "web_search"},
+        ],
+    })
+
+
+def test_web_search_param_query_to_search_query():
+    """query parameter must remap to search_query when replacement expects search_query."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "function", "name": "web_search", "description": "Search the web",
+             "parameters": {"type": "object", "properties": {"search_query": {"type": "string"}},
+                            "required": ["search_query"]}},
+            {"type": "web_search"},
+        ],
+    })
+
+
+def test_web_search_case_insensitive_description_match():
+    """Description-based web search matching must be case-insensitive."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "function", "name": "lookup", "description": "WEB Search for content on the INTERNET"},
+            {"type": "web_search"},
+        ],
+    })
+
+
+def test_web_search_not_code_file_repo_search():
+    """Tools described as code/file/repository/grep/local search must NOT match as web search."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "function", "name": "search", "description": "Search code in repository"},
+            {"type": "function", "name": "grep", "description": "Search file contents with grep"},
+            {"type": "function", "name": "file_search", "description": "Search local file system"},
+            {"type": "web_search"},
+        ],
+    })
+
+
+def test_web_search_no_replacement_skipped_safely():
+    """When no web-search-compatible tool is available, web_search is safely skipped."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "function", "name": "get_weather", "description": "Get weather",
+             "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}},
+            {"type": "web_search"},
+        ],
+    })
+
+
+def test_web_search_mixed_with_custom_shell_and_namespace_mcp_roundtrip():
+    """Mixed web_search + custom shell + namespace MCP must round-trip successfully."""
+    global server
+    server.start()
+    _check_tool_conversion({
+        "tools": [
+            {"type": "function", "name": "search_web", "description": "Search the web for information",
+             "parameters": {"type": "object", "properties": {"q": {"type": "string"}},
+                            "required": ["q"]}},
+            {"type": "custom", "name": "exec", "description": "Execute a shell command"},
+            {"type": "namespace", "name": "mcp", "description": "MCP namespace", "tools": [
+                {"type": "function", "name": "read_file", "description": "Read a file",
+                 "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}},
+            ]},
+            {"type": "tool_search", "execution": "sync", "description": "Search available tools"},
+            {"type": "web_search"},
+        ],
+    })

@@ -1,6 +1,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 
+#include <algorithm>
 #include <cctype>
 #include <sstream>
 
@@ -386,12 +387,11 @@ static json build_responses_tool_map(const json & response_body) {
 
 // Try to find a client search tool to use as web_search replacement.
 // Returns the matching tool entry from chatcmpl_tools (or null if none found).
-static json find_web_search_replacement(const std::vector<json> & chatcmpl_tools) {
-    // Candidate search tool names (ordered by preference)
-    static const char * search_names[] = {
-        "web_search", "search_web", "websearch", "browser_search",
-        "search", "fetch_url", "browser", nullptr,
-    };
+// When explicit_name is set, only match that exact function name.
+static json find_web_search_replacement(
+    const std::vector<json> & chatcmpl_tools,
+    const std::string & explicit_name = "")
+{
     for (const auto & tool : chatcmpl_tools) {
         if (!tool.is_object() || !tool.contains("function") || !tool.at("function").is_object()) {
             continue;
@@ -401,30 +401,72 @@ static json find_web_search_replacement(const std::vector<json> & chatcmpl_tools
         const std::string desc = json_value(fn, "description", std::string());
         if (name.empty()) { continue; }
 
-        // Check if name matches a search pattern
-        bool is_search = false;
-        for (const char ** p = search_names; *p; p++) {
-            if (name == *p) { is_search = true; break; }
+        // Explicit name match has highest priority
+        if (!explicit_name.empty()) {
+            if (name == explicit_name) {
+                return tool;
+            }
+            continue;
         }
-        // Also check description for web search indicators
-        if (!is_search) {
-            const std::string desc_lower = desc;
-            if (desc_lower.find("web") != std::string::npos &&
-                desc_lower.find("search") != std::string::npos) {
-                is_search = true;
+
+        // Auto-matching: all comparisons are case-insensitive
+        std::string name_lower = name;
+        std::string desc_lower = desc;
+        std::transform(name_lower.begin(), name_lower.end(), name_lower.begin(), ::tolower);
+        std::transform(desc_lower.begin(), desc_lower.end(), desc_lower.begin(), ::tolower);
+
+        // Phase 1: Exact web-search names always match
+        static const char * exact_web_names[] = {
+            "web_search", "search_web", "websearch", "browser_search", nullptr,
+        };
+        for (const char ** p = exact_web_names; *p; p++) {
+            if (name_lower == *p) { return tool; }
+        }
+
+        // Phase 2: Generic names (search, browser, fetch_url, fetch) ONLY match
+        // if description clearly indicates web search
+        bool is_generic = false;
+        static const char * generic_search_names[] = {
+            "search", "browser", "fetch_url", "fetch", nullptr,
+        };
+        for (const char ** p = generic_search_names; *p; p++) {
+            if (name_lower == *p) { is_generic = true; break; }
+        }
+
+        if (is_generic) {
+            // Description must mention both web/internet AND search/fetch/browse
+            bool has_web = desc_lower.find("web") != std::string::npos ||
+                           desc_lower.find("internet") != std::string::npos;
+            bool has_search = desc_lower.find("search") != std::string::npos ||
+                              desc_lower.find("fetch") != std::string::npos ||
+                              desc_lower.find("browse") != std::string::npos;
+            if (!has_web || !has_search) {
+                continue;
+            }
+        } else {
+            // Non-generic names: check description for web+search indicators
+            if (!(desc_lower.find("web") != std::string::npos &&
+                  desc_lower.find("search") != std::string::npos)) {
+                continue;
             }
         }
-        // Filter out non-web search tools
-        if (is_search) {
-            if (desc.find("tool_search") != std::string::npos ||
-                desc.find("grep") != std::string::npos ||
-                desc.find("file") != std::string::npos ||
-                desc.find("code") != std::string::npos ||
-                desc.find("repository") != std::string::npos) {
-                continue; // not web search
+
+        // Filter out non-web tools by description keywords (case-insensitive)
+        static const char * exclude_keywords[] = {
+            "code", "file", "repository", "grep", "tool search", "local", nullptr,
+        };
+        bool excluded = false;
+        for (const char ** p = exclude_keywords; *p; p++) {
+            if (desc_lower.find(*p) != std::string::npos) {
+                excluded = true;
+                break;
             }
-            return tool;
         }
+        if (excluded) {
+            continue;
+        }
+
+        return tool;
     }
     return json();
 }
@@ -746,13 +788,17 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 chatcmpl_tools.push_back(std::move(t));
             }
         }
+        // Build the full tool map from original response tools (includes function/custom/namespace/tool_search)
+        json tool_map = build_responses_tool_map(response_body);
+
+        // Check for explicitly configured web-search replacement tool name (from body field)
+        const std::string configured_ws_tool = json_value(response_body, "__responses_web_search_tool", std::string());
+
         // Try to replace web_search tools with client search tools
-        json ws_tool_map_obj = json::object();
         for (const json & ws : web_search_tools) {
-            json replacement = find_web_search_replacement(chatcmpl_tools);
+            json replacement = find_web_search_replacement(chatcmpl_tools, configured_ws_tool);
             if (replacement.is_null()) {
-                SRV_WRN("no compatible client web-search tool available; web_search skipped
-");
+                SRV_WRN("%s", "no compatible client web-search tool available; web_search skipped\n");
                 continue;
             }
             // Add the replacement function tool with web_search-like parameter schema
@@ -785,10 +831,11 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 }
             }
             // Create a web_search-exposed function tool
+            const std::string ws_exposed_name = "web_search";
             json ws_exposed = json{
                 {"type", "function"},
                 {"function", json{
-                    {"name", "web_search"},
+                    {"name", ws_exposed_name},
                     {"description", json_value(ws_fn, "description", std::string())},
                     {"parameters", ws_params},
                     {"strict", false},
@@ -796,19 +843,35 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             };
             chatcmpl_tools.push_back(ws_exposed);
 
+            // Look up the replacement's original type from the tool map
+            // (instead of guessing from replacement["type"] which is always "function")
+            const std::string repl_fn_name = json_value(ws_fn, "name", std::string());
+            std::string repl_orig_type = "function";
+            std::string repl_orig_name = repl_fn_name;
+            std::string repl_ns_name;
+            auto orig_it = tool_map.find(repl_fn_name);
+            if (orig_it != tool_map.end() && orig_it->value().is_object()) {
+                repl_orig_type = json_value(orig_it->value(), "original_type", std::string("function"));
+                repl_orig_name = json_value(orig_it->value(), "original_name", repl_fn_name);
+                repl_ns_name  = json_value(orig_it->value(), "namespace_name", std::string());
+            }
             // Record replacement mapping for round-trip
-            const std::string repl_name = json_value(ws_fn, "name", std::string());
             json repl_info = json{
                 {"original_type", "web_search"},
-                {"replacement_exposed_name", "web_search"},
-                {"replacement_original_type", json_value(replacement, "type", std::string("function"))},
-                {"replacement_original_name", repl_name},
+                {"replacement_exposed_name", ws_exposed_name},
+                {"replacement_original_type", repl_orig_type},
+                {"replacement_original_name", repl_orig_name},
             };
-            ws_tool_map_obj["web_search"] = repl_info;
+            if (!repl_ns_name.empty()) {
+                repl_info["namespace_name"] = repl_ns_name;
+            }
+            // Store replacement schema for parameter remapping on return
+            repl_info["replacement_parameters"] = ws_params;
+            tool_map[ws_exposed_name] = repl_info;
         }
-        // Store web_search replacement mapping in body for tool map extraction
-        if (!ws_tool_map_obj.empty()) {
-            chatcmpl_body["__responses_tool_map"] = ws_tool_map_obj;
+        // Store complete tool map (includes all function/custom/namespace/tool_search + web_search)
+        if (!tool_map.empty()) {
+            chatcmpl_body["__responses_tool_map"] = tool_map;
         }
         if (!chatcmpl_tools.empty()) {
             chatcmpl_body["tools"] = chatcmpl_tools;

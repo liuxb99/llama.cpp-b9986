@@ -4892,10 +4892,13 @@ void server_routes::init_routes() {
         }
 
         // Inject tool mapping for output round-trip
-        // Prefer map from conversion (may include web_search replacement entries)
-        json tool_map = json_value(body, "__responses_tool_map", json::object());
-        if (tool_map.empty()) {
-            tool_map = build_responses_tool_map(response_body);
+        // Build the full map from original response tools (function/custom/namespace/tool_search)
+        json tool_map = build_responses_tool_map(response_body);
+        // Merge any additional entries from the conversion (e.g. web_search replacement mapping)
+        // This ensures web_search entries don't overwrite function/custom/namespace/tool_search entries
+        const json extra_map = json_value(body, "__responses_tool_map", json::object());
+        for (auto it = extra_map.begin(); it != extra_map.end(); ++it) {
+            tool_map[it.key()] = it.value();
         }
         body.erase("__responses_tool_map");
         if (!tool_map.empty()) {
