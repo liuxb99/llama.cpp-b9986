@@ -982,6 +982,33 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     if (has_incomplete_tool) {
         resp["incomplete_details"] = json{{"reason", "incomplete_tool_call"}};
     }
+
+    // [RESP_CTX] response_final (non-streaming)
+    if (resp_ctx_debug_enabled() && !generation_params.responses_tool_map.empty()) {
+        size_t n_msg = 0, n_fn = 0, n_cust = 0, n_ns = 0, n_ts = 0, n_ws = 0, n_incomplete = 0;
+        for (const auto & item : output) {
+            std::string t = json_value(item, "type", std::string());
+            if (t == "message")              n_msg++;
+            else if (t == "function_call")    n_fn++;
+            else if (t == "custom_tool_call") n_cust++;
+            else if (t == "tool_search_call") n_ts++;
+            else if (t == "web_search_call")  n_ws++;
+            std::string s = json_value(item, "status", std::string());
+            if (s == "incomplete") n_incomplete++;
+        }
+        int nt = n_prompt_tokens + n_decoded;
+        SRV_CNT("[RESP_CTX] stage=response_final"
+                " task=%d input_tokens=%d cached_tokens=%d output_tokens=%d total_tokens=%d"
+                " items=%zu msg=%zu fn=%zu cust=%zu ts=%zu ws=%zu incomplete=%zu status=%s streaming=0\n",
+                id, n_prompt_tokens, n_prompt_tokens_cache, n_decoded, nt,
+                output.size(), n_msg, n_fn, n_cust, n_ts, n_ws, n_incomplete, status.c_str());
+        // [RESP_CTX][WARN] if total_tokens != input+output (impossible, but check anyway)
+        if (nt != n_prompt_tokens + n_decoded) {
+            SRV_CNT("[RESP_CTX][WARN] stage=response_final: total_tokens mismatch input_tokens=%d output_tokens=%d total_tokens=%d\n",
+                    n_prompt_tokens, n_decoded, nt);
+        }
+    }
+
     return resp;
 }
 
@@ -1082,6 +1109,31 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     if (has_incomplete_tool) {
         completed_resp["incomplete_details"] = json{{"reason", "incomplete_tool_call"}};
     }
+    // [RESP_CTX] response_final (streaming)
+    if (resp_ctx_debug_enabled() && !generation_params.responses_tool_map.empty()) {
+        size_t n_msg = 0, n_fn = 0, n_cust = 0, n_ns = 0, n_ts = 0, n_ws = 0, n_incomplete = 0;
+        for (const auto & item : output) {
+            std::string t = json_value(item, "type", std::string());
+            if (t == "message")              n_msg++;
+            else if (t == "function_call")    n_fn++;
+            else if (t == "custom_tool_call") n_cust++;
+            else if (t == "tool_search_call") n_ts++;
+            else if (t == "web_search_call")  n_ws++;
+            std::string s = json_value(item, "status", std::string());
+            if (s == "incomplete") n_incomplete++;
+        }
+        int nt = n_prompt_tokens + n_decoded;
+        SRV_CNT("[RESP_CTX] stage=response_final"
+                " task=%d input_tokens=%d cached_tokens=%d output_tokens=%d total_tokens=%d"
+                " items=%zu msg=%zu fn=%zu cust=%zu ts=%zu ws=%zu incomplete=%zu status=%s streaming=1\n",
+                id, n_prompt_tokens, n_prompt_tokens_cache, n_decoded, nt,
+                output.size(), n_msg, n_fn, n_cust, n_ts, n_ws, n_incomplete, final_status.c_str());
+        if (nt != n_prompt_tokens + n_decoded) {
+            SRV_CNT("[RESP_CTX][WARN] stage=response_final: total_tokens mismatch input_tokens=%d output_tokens=%d total_tokens=%d\n",
+                    n_prompt_tokens, n_decoded, nt);
+        }
+    }
+
     server_sent_events.push_back(json {{"event", "response.completed"}, {"data", json{
         {"type", "response.completed"}, {"sequence_number", seq_num++},
         {"response", completed_resp},

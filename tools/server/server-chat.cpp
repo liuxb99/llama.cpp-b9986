@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <set>
 #include <sstream>
 
 static bool exists_and_is_array(const json & j, const char * key) { return j.contains(key) && j.at(key).is_array(); }
@@ -510,6 +511,37 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     chatcmpl_body.erase("previous_response_id");
     std::vector<json> chatcmpl_messages;
 
+    // [RESP_CTX] request_convert_start
+    uint32_t resp_diag_seq = 0;
+    if (resp_ctx_debug_enabled()) {
+        resp_diag_seq = resp_ctx_next_seq();
+        const char * input_type = input_value.is_string() ? "string" : (input_value.is_array() ? "array" : (input_value.is_object() ? "object" : "other"));
+        size_t input_items = input_value.is_array() ? input_value.size() : 1;
+        size_t instructions_chars = response_body.contains("instructions") ? response_body["instructions"].get<std::string>().size() : 0;
+        size_t n_fn = 0, n_cust = 0, n_ns = 0, n_ns_sub = 0, n_ts = 0, n_ws = 0, n_unk = 0;
+        if (response_body.contains("tools") && response_body["tools"].is_array()) {
+            for (const auto & t : response_body["tools"]) {
+                const std::string tt = json_value(t, "type", std::string());
+                if (tt == "function")       { n_fn++; }
+                else if (tt == "custom")    { n_cust++; }
+                else if (tt == "namespace") { n_ns++; if (t.contains("tools") && t["tools"].is_array()) n_ns_sub += t["tools"].size(); }
+                else if (tt == "tool_search") { n_ts++; }
+                else if (tt == "web_search")  { n_ws++; }
+                else                        { n_unk++; }
+            }
+        }
+        std::string ws_mode = json_value(response_body, "__responses_web_search_mode", std::string("native"));
+        size_t body_chars = response_body.dump().size();
+        SRV_CNT("[RESP_CTX] stage=request_convert_start"
+                " diag_seq=%u input_type=%s input_items=%zu instructions_chars=%zu"
+                " tools=%zu fn=%zu cust=%zu ns=%zu ns_sub=%zu ts=%zu ws=%zu unk=%zu"
+                " ws_mode=%s body_chars=%zu\n",
+                resp_diag_seq, input_type, input_items, instructions_chars,
+                n_fn + n_cust + n_ns + n_ts + n_ws + n_unk,
+                n_fn, n_cust, n_ns, n_ns_sub, n_ts, n_ws, n_unk,
+                ws_mode.c_str(), body_chars);
+    }
+
     if (response_body.contains("instructions")) {
         chatcmpl_messages.push_back({
             {"role",    "system"},
@@ -787,6 +819,40 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         throw std::invalid_argument("'input' must be a string or array of objects");
     }
 
+    // [RESP_CTX] history_conversion
+    if (resp_ctx_debug_enabled() && input_value.is_array()) {
+        size_t hist_total = 0, fn_calls = 0, fn_outputs = 0, cust_calls = 0, cust_outputs = 0, ts_calls = 0, ws_calls = 0, unknown = 0, dup_call_ids = 0;
+        std::set<std::string> seen_call_ids;
+        for (const auto & hist_item : input_value) {
+            if (!hist_item.is_object()) continue;
+            std::string ht = json_value(hist_item, "type", std::string());
+            if (ht == "function_call")            { fn_calls++; }
+            else if (ht == "function_call_output") { fn_outputs++; }
+            else if (ht == "custom_tool_call")    { cust_calls++; }
+            else if (ht == "custom_tool_call_output") { cust_outputs++; }
+            else if (ht == "tool_search_call")    { ts_calls++; }
+            else if (ht == "web_search_call")     { ws_calls++; }
+            else if (ht == "message" || ht == "reasoning") { /* counted in hist_total */ }
+            else { unknown++; }
+            hist_total++;
+            std::string cid = json_value(hist_item, "call_id", std::string());
+            if (!cid.empty()) {
+                if (!seen_call_ids.insert(cid).second) dup_call_ids++;
+            }
+        }
+        std::string hist_dump = input_value.dump();
+        size_t hist_chars = hist_dump.size();
+        uint32_t hist_hash = resp_ctx_hash(hist_dump);
+        size_t conv_msgs = chatcmpl_messages.size();
+        SRV_CNT("[RESP_CTX] stage=history_conversion"
+                " diag_seq=%u input_items=%zu conv_msgs=%zu"
+                " fn_calls=%zu fn_outputs=%zu cust_calls=%zu cust_outputs=%zu ts_calls=%zu ws_calls=%zu unknown=%zu"
+                " hist_chars=%zu hist_hash=%08x dup_call_ids=%zu\n",
+                resp_diag_seq, hist_total, conv_msgs,
+                fn_calls, fn_outputs, cust_calls, cust_outputs, ts_calls, ws_calls, unknown,
+                hist_chars, hist_hash, dup_call_ids);
+    }
+
     chatcmpl_body["messages"] = chatcmpl_messages;
 
     // Convert tools
@@ -965,6 +1031,25 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         "service_tier", "safety_identifier", "max_tool_calls",
     }) {
         chatcmpl_body.erase(key);
+    }
+
+    // [RESP_CTX] request_convert_end
+    if (resp_ctx_debug_enabled()) {
+        size_t n_msgs = chatcmpl_body.contains("messages") && chatcmpl_body["messages"].is_array() ? chatcmpl_body["messages"].size() : 0;
+        size_t n_tools = chatcmpl_body.contains("tools") && chatcmpl_body["tools"].is_array() ? chatcmpl_body["tools"].size() : 0;
+        size_t n_map = 0, n_orig_tool = 0;
+        if (chatcmpl_body.contains("__responses_tool_map") && chatcmpl_body["__responses_tool_map"].is_object()) {
+            n_map = chatcmpl_body["__responses_tool_map"].size();
+            for (const auto & entry : chatcmpl_body["__responses_tool_map"].items()) {
+                if (entry.value().is_object() && entry.value().contains("original_tool")) n_orig_tool++;
+            }
+        }
+        size_t body_chars = chatcmpl_body.dump().size();
+        int has_tools = chatcmpl_body.contains("tools") ? 1 : 0;
+        int has_map  = chatcmpl_body.contains("__responses_tool_map") ? 1 : 0;
+        SRV_CNT("[RESP_CTX] stage=request_convert_end"
+                " diag_seq=%u messages=%zu tools=%zu tool_map=%zu original_tool=%zu body_chars=%zu has_tools=%d has_map=%d\n",
+                resp_diag_seq, n_msgs, n_tools, n_map, n_orig_tool, body_chars, has_tools, has_map);
     }
 
     return chatcmpl_body;

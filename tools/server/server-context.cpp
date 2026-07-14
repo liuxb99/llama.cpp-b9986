@@ -3381,6 +3381,32 @@ private:
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
+                        // [RESP_CTX] slot_prompt
+                        if (resp_ctx_debug_enabled()) {
+                            int total_tokens = slot.task->n_tokens();
+                            int new_tokens = total_tokens - n_past;
+                            double cache_pct = total_tokens > 0 ? (100.0 * n_past / total_tokens) : 0.0;
+                            int cache_flag = (n_past > 0) ? 1 : 0;
+                            double ctx_used_pct = slot.n_ctx > 0 ? (100.0 * total_tokens / slot.n_ctx) : 0.0;
+                            int ctx_shift = params_base.ctx_shift ? 1 : 0;
+                            // Only log for Responses-derived requests (check task params for tool_map)
+                            int is_resp = (slot.task->params.responses_tool_map.size() > 0) ? 1 : 0;
+                            if (is_resp) {
+                                SRV_CNT("[RESP_CTX] stage=slot_prompt"
+                                        " slot=%d task=%d n_ctx_slot=%d n_parallel=%d"
+                                        " prompt_tokens=%d n_past=%d new_tokens=%d"
+                                        " cache=%d cache_pct=%.1f ctx_used_pct=%.1f ctx_shift=%d\n",
+                                        slot.id, slot.task->id, slot.n_ctx, params_base.n_parallel,
+                                        total_tokens, n_past, new_tokens,
+                                        cache_flag, cache_pct, ctx_used_pct, ctx_shift);
+                                // [RESP_CTX][WARN] if prompt exceeds 70% of context
+                                if (total_tokens > 0 && ctx_used_pct > 70.0) {
+                                    SRV_CNT("[RESP_CTX][WARN] stage=slot_prompt: prompt uses %.1f%% of n_ctx_slot (%d/%d)\n",
+                                            ctx_used_pct, total_tokens, slot.n_ctx);
+                                }
+                            }
+                        }
+
                         slot.prompt.tokens.keep_first(n_past);
 
                         // this is to signal the client that the request has started processing

@@ -8,9 +8,43 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <string>
 
 using json = nlohmann::ordered_json;
+
+// ---------------------------------------------------------------------------
+// Diagnostic helpers for Responses context/tool-bridge debugging
+// Controlled by LLAMA_RESPONSES_CONTEXT_DEBUG=1 env var (default: off)
+// All logging uses [RESP_CTX] prefix for easy filtering.
+// ---------------------------------------------------------------------------
+
+// Simple FNV-1a hash for diagnostic fingerprinting (no external deps)
+static inline uint32_t resp_ctx_hash(const std::string & s) {
+    uint32_t h = 2166136261u;
+    for (unsigned char c : s) {
+        h ^= c;
+        h *= 16777619u;
+    }
+    return h;
+}
+
+// Returns true once when LLAMA_RESPONSES_CONTEXT_DEBUG=1
+static inline bool resp_ctx_debug_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("LLAMA_RESPONSES_CONTEXT_DEBUG");
+        return env && std::strcmp(env, "1") == 0;
+    }();
+    return enabled;
+}
+
+// Monotonic diagnostic sequence counter for correlating logs across stages
+static inline uint32_t resp_ctx_next_seq() {
+    static std::atomic<uint32_t> seq{0};
+    return ++seq;
+}
 
 // Sanitize a tool/function name for use as a JSON key
 std::string sanitize_tool_name(const std::string & name, const std::string & fallback = "tool");

@@ -7,6 +7,7 @@
 #include "chat.h"
 #include "base64.hpp"
 
+#include "server-chat.h"
 #include "server-common.h"
 
 #include <random>
@@ -1112,6 +1113,51 @@ json oaicompat_chat_params_parse(
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;
+
+    // [RESP_CTX] prompt_ready
+    if (resp_ctx_debug_enabled() && body.contains("__responses_tool_map")) {
+        const std::string & prompt_str = chat_params.prompt;
+        size_t prompt_chars = prompt_str.size();
+        uint32_t prefix_hash = prompt_chars > 256 ? resp_ctx_hash(prompt_str.substr(0, 256)) : resp_ctx_hash(prompt_str);
+        uint32_t prompt_hash = resp_ctx_hash(prompt_str);
+        int has_map_marker = prompt_str.find("__responses_tool_map") != std::string::npos ? 1 : 0;
+        int has_orig_marker = prompt_str.find("original_tool") != std::string::npos ? 1 : 0;
+        size_t n_msgs = inputs.messages.size();
+        size_t n_sys = 0, n_dev = 0, n_user = 0, n_asst = 0, n_tool = 0;
+        for (const auto & m : inputs.messages) {
+            const std::string & role = m.role;
+            if (role == "system")    n_sys++;
+            else if (role == "developer") n_dev++;
+            else if (role == "user") n_user++;
+            else if (role == "assistant") n_asst++;
+            else if (role == "tool") n_tool++;
+        }
+        size_t n_tool_schema = 0;
+        std::string tool_schema_str;
+        if (body.contains("tools") && body["tools"].is_array()) {
+            tool_schema_str = body["tools"].dump();
+            n_tool_schema = body["tools"].size();
+        }
+        size_t tool_schema_chars = tool_schema_str.size();
+        int has_grammar = !chat_params.grammar.empty() ? 1 : 0;
+        SRV_CNT("[RESP_CTX] stage=prompt_ready"
+                " messages=%zu sys=%zu dev=%zu user=%zu asst=%zu tool=%zu"
+                " tool_schema=%zu tool_schema_chars=%zu"
+                " prompt_chars=%zu prefix_hash=%08x prompt_hash=%08x"
+                " map_marker=%d orig_marker=%d grammar=%d\n",
+                n_msgs, n_sys, n_dev, n_user, n_asst, n_tool,
+                n_tool_schema, tool_schema_chars,
+                prompt_chars, prefix_hash, prompt_hash,
+                has_map_marker, has_orig_marker, has_grammar);
+
+        // [RESP_CTX][WARN] if tool_map markers are in prompt
+        if (has_map_marker || has_orig_marker) {
+            SRV_CNT("[RESP_CTX][WARN] stage=prompt_ready: tool_map/original_tool marker found in prompt!"
+                    " map_marker=%d orig_marker=%d\n",
+                    has_map_marker, has_orig_marker);
+        }
+    }
+
     if (!chat_params.grammar.empty()) {
         llama_params["grammar"]      = chat_params.grammar;
         llama_params["grammar_type"] = std::string("tool_calls");
