@@ -180,7 +180,7 @@ common_chat_msg task_result_state::update_chat_msg(
     // Try XML fallback when PEG parser found no tool calls
     // (Responses bridge: tools kept out of prompt, model still emits XML tool call tags)
     if (new_msg.tool_calls.empty()) {
-        SRV_INF("== PEG_PARSER: 0 tool_calls, trying XML fallback\n");
+        SRV_INF("== PEG_PARSER: 0 tool_calls, trying XML fallback, text_chars=%zu\n", generated_text.size());
         bool has_xml_tag = generated_text.find("<tool_call>") != std::string::npos ||
                            generated_text.find("<invoke") != std::string::npos ||
                            generated_text.find("<tool_search>") != std::string::npos;
