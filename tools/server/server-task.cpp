@@ -164,6 +164,14 @@ common_chat_msg task_result_state::update_chat_msg(
     generated_text += text_added;
     auto msg_prv_copy = chat_msg;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
+    // [DEBUG] Log raw model output before parse
+    SRV_INF("== PARSER_INPUT: generated_text_chars=%zu is_partial=%d format=%s parse_tool_calls=%d\n",
+        generated_text.size(), (int)is_partial,
+        common_chat_format_name(chat_parser_params.format),
+        (int)chat_parser_params.parse_tool_calls);
+    // Log first 500 chars of raw output
+    SRV_INF("== RAW_OUTPUT_BEGIN (first 500 chars of %zu) ==\n%.500s\n== RAW_OUTPUT_END ==\n",
+        generated_text.size(), generated_text.c_str());
     auto new_msg = common_chat_parse(
         generated_text,
         is_partial,
@@ -172,16 +180,27 @@ common_chat_msg task_result_state::update_chat_msg(
     // Try XML fallback when PEG parser found no tool calls
     // (Responses bridge: tools kept out of prompt, model still emits XML tool call tags)
     if (new_msg.tool_calls.empty()) {
+        SRV_INF("== PEG_PARSER: 0 tool_calls, trying XML fallback\n");
         bool has_xml_tag = generated_text.find("<tool_call>") != std::string::npos ||
                            generated_text.find("<invoke") != std::string::npos ||
                            generated_text.find("<tool_search>") != std::string::npos;
+        SRV_INF("== XML_TAG_CHECK: has_xml_tag=%d\n", (int)has_xml_tag);
         if (has_xml_tag) {
             parse_xml_tool_call_fallback(generated_text, is_partial,
                 chat_parser_params.generation_prompt, new_msg, resp_tool_map);
+            SRV_INF("== XML_FALLBACK: tool_calls=%zu\n", new_msg.tool_calls.size());
         }
     }
 
     if (!new_msg.empty()) {
+        SRV_INF("== PARSER_RESULT: tool_calls=%zu content_chars=%zu\n",
+            new_msg.tool_calls.size(), new_msg.content.size());
+        for (size_t ti = 0; ti < new_msg.tool_calls.size(); ti++) {
+            SRV_INF("== TOOL_CALL[%zu]: name=%s id=%s arguments_chars=%zu\n",
+                ti, new_msg.tool_calls[ti].name.c_str(),
+                new_msg.tool_calls[ti].id.c_str(),
+                new_msg.tool_calls[ti].arguments.size());
+        }
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
         chat_msg = new_msg;
         auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
@@ -980,6 +999,15 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
         msg.content = content;
     }
 
+    SRV_INF("== FINAL_CHAT_MSG: content_chars=%zu tool_calls=%zu\n",
+        msg.content.size(), msg.tool_calls.size());
+    for (size_t ti = 0; ti < msg.tool_calls.size(); ti++) {
+        SRV_INF("== FINAL_TOOL_CALL[%zu]: name=%s id=%s args_chars=%zu\n",
+            ti, msg.tool_calls[ti].name.c_str(),
+            msg.tool_calls[ti].id.c_str(),
+            msg.tool_calls[ti].arguments.size());
+    }
+
     std::vector<json> output;
 
     if (msg.reasoning_content != "") {
@@ -1058,6 +1086,15 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     std::vector<json> output;
     int seq_num = oai_resp_seq_num;
     int output_idx = 0;
+
+    SRV_INF("== STREAM_FINAL: tool_calls=%zu content_chars=%zu\n",
+        oaicompat_msg.tool_calls.size(), oaicompat_msg.content.size());
+    for (size_t ti = 0; ti < oaicompat_msg.tool_calls.size(); ti++) {
+        SRV_INF("== STREAM_TOOL_CALL[%zu]: name=%s id=%s args_chars=%zu\n",
+            ti, oaicompat_msg.tool_calls[ti].name.c_str(),
+            oaicompat_msg.tool_calls[ti].id.c_str(),
+            oaicompat_msg.tool_calls[ti].arguments.size());
+    }
 
     if (oaicompat_msg.reasoning_content != "") {
         const json output_item = {
