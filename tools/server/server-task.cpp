@@ -722,21 +722,39 @@ static json restore_responses_tool_call(
                 {"id",        fc_item_id},
                 {"type",      "custom_tool_call"},
                 {"status",    status},
-                {"arguments", raw_input},
+                {"input",     raw_input},
                 {"call_id",   "call_" + tool_call.id},
                 {"name",      json_value(it->second, "original_name", tool_call.name)},
             };
         } else if (orig_type == "tool_search") {
+            json args_parsed = json::object();
+            try {
+                json parsed = json::parse(tool_call.arguments);
+                if (parsed.is_object()) {
+                    args_parsed = parsed;
+                }
+            } catch (...) {}
+            std::string execution = json_value(it->second, "execution", std::string("sync"));
             return json {
-                {"id",        fc_item_id},
-                {"type",      "function_call"},
-                {"status",    status},
-                {"arguments", tool_call.arguments},
-                {"call_id",   "call_" + tool_call.id},
-                {"name",      "tool_search"},
+                {"id",            fc_item_id},
+                {"type",          "tool_search_call"},
+                {"status",        status},
+                {"call_id",       "call_" + tool_call.id},
+                {"execution",     execution},
+                {"arguments",     args_parsed},
+            };
+        } else if (orig_type == "namespace") {
+            return json {
+                {"id",            fc_item_id},
+                {"type",          "function_call"},
+                {"status",        status},
+                {"arguments",     tool_call.arguments},
+                {"call_id",       "call_" + tool_call.id},
+                {"name",          json_value(it->second, "original_name", tool_call.name)},
+                {"namespace",     json_value(it->second, "namespace_name", std::string())},
             };
         }
-        // namespace and function: keep function_call
+        // function: keep function_call
     }
     // Default: function_call with sanitized name
     return json {
@@ -867,6 +885,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
         const std::string restored_type = json_value(restored, "type", std::string("function_call"));
         const std::string restored_name = json_value(restored, "name", tool_call.name);
 
+        // function_call_arguments.done only for native function_call items
         if (valid && restored_type == "function_call") {
             // function_call_arguments.done - only for complete function_call items
             server_sent_events.push_back(json {{"event", "response.function_call_arguments.done"}, {"data", json{

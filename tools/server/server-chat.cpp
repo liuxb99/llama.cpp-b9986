@@ -374,6 +374,7 @@ static json build_responses_tool_map(const json & response_body) {
             map_obj["tool_search"] = json{
                 {"original_type", "tool_search"},
                 {"description", json_value(tool, "description", std::string())},
+                {"execution", json_value(tool, "execution", std::string("sync"))},
             };
         }
     }
